@@ -1,0 +1,177 @@
+//! Walking a folder: the files and symlinks that sync, with their stat data.
+//! What changed is decided by the caller against what it last saw. Everything
+//! here blocks.
+
+use crate::folder::{
+    disk::{self, Stat},
+    rules::Rules,
+};
+use std::{
+    collections::BTreeMap,
+    fs,
+    io::ErrorKind,
+    path::Path,
+};
+
+/// What a walk found.
+#[derive(Debug, Default)]
+pub struct Walked {
+    /// Every syncable path in the walked scope, by folder path.
+    pub files: BTreeMap<String, Stat>,
+    /// Paths that could not be read, with why. Nothing under them counts as
+    /// deleted.
+    pub unreadable: BTreeMap<String, String>,
+}
+
+/// What part of a folder to walk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    All,
+    /// These paths and, for directories, everything under them.
+    Paths(Vec<String>),
+}
+
+impl Scope {
+    /// Whether `path` lies in this scope.
+    pub fn covers(&self, path: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Paths(paths) => paths.iter().any(|scoped| within(path, scoped)),
+        }
+    }
+}
+
+/// Whether `path` is `dir` or inside it.
+pub fn within(path: &str, dir: &str) -> bool {
+    path == dir || (path.starts_with(dir) && path.as_bytes().get(dir.len()) == Some(&b'/'))
+}
+
+pub fn walk(root: &Path, rules: &Rules, scope: &Scope) -> Walked {
+    let mut walked = Walked::default();
+
+    match scope {
+        Scope::All => walk_dir(root, "", rules, &mut walked),
+        Scope::Paths(paths) => {
+            for path in paths {
+                if rules.excluded(path, false) {
+                    continue;
+                }
+
+                let full = disk::join(root, path);
+                match fs::symlink_metadata(&full) {
+                    Ok(meta) if meta.is_dir() => {
+                        if !rules.excluded(path, true) {
+                            walk_dir(root, path, rules, &mut walked);
+                        }
+                    }
+                    Ok(meta) => {
+                        if let Some(stat) = Stat::of(&meta) {
+                            walked.files.insert(path.clone(), stat);
+                        }
+                    }
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(e) => {
+                        walked.unreadable.insert(path.clone(), e.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    walked
+}
+
+fn walk_dir(root: &Path, dir: &str, rules: &Rules, walked: &mut Walked) {
+    let full = disk::join(root, dir);
+    let full = if dir.is_empty() { root.to_owned() } else { full };
+    let entries = match fs::read_dir(&full) {
+        Ok(entries) => entries,
+        Err(e) => {
+            walked.unreadable.insert(dir.to_owned(), e.to_string());
+            return;
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                walked.unreadable.insert(dir.to_owned(), e.to_string());
+                continue;
+            }
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            tracing::warn!("skipping a name that is not UTF-8 in {}", full.display());
+            continue;
+        };
+        let path = if dir.is_empty() {
+            name
+        } else {
+            format!("{dir}/{name}")
+        };
+        let meta = match entry.path().symlink_metadata() {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(e) => {
+                walked.unreadable.insert(path, e.to_string());
+                continue;
+            }
+        };
+        let is_dir = meta.is_dir();
+
+        if rules.excluded(&path, is_dir) {
+            continue;
+        }
+
+        if is_dir {
+            walk_dir(root, &path, rules, walked);
+        } else if let Some(stat) = Stat::of(&meta) {
+            walked.files.insert(path, stat);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn walks_what_the_rules_keep() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = dir.path();
+        fs::create_dir_all(root.join(".git")).expect("mkdir");
+        fs::create_dir_all(root.join("src/deep")).expect("mkdir");
+        fs::create_dir_all(root.join("target")).expect("mkdir");
+        fs::create_dir_all(root.join(".syncer")).expect("mkdir");
+        fs::write(root.join(".gitignore"), "target/\n").expect("write");
+        fs::write(root.join("src/deep/a.rs"), "a").expect("write");
+        fs::write(root.join("target/out"), "o").expect("write");
+        fs::write(root.join(".git/HEAD"), "ref").expect("write");
+        fs::write(root.join(".syncer/folder"), "id").expect("write");
+
+        let rules = Rules::new(root, true);
+        let walked = walk(root, &rules, &Scope::All);
+        let paths: Vec<_> = walked.files.keys().map(String::as_str).collect();
+
+        assert_eq!(paths, [".gitignore", "src/deep/a.rs"]);
+    }
+
+    #[test]
+    fn walks_only_the_scope() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("a/b")).expect("mkdir");
+        fs::write(root.join("a/b/c"), "c").expect("write");
+        fs::write(root.join("x"), "x").expect("write");
+
+        let rules = Rules::new(root, true);
+        let scope = Scope::Paths(vec!["a".into(), "gone".into()]);
+        let walked = walk(root, &rules, &scope);
+
+        assert_eq!(walked.files.keys().collect::<Vec<_>>(), ["a/b/c"]);
+        assert!(scope.covers("a/b/c"));
+        assert!(scope.covers("gone"));
+        assert!(!scope.covers("ab"));
+        assert!(!scope.covers("x"));
+    }
+}
