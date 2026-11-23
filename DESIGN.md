@@ -92,21 +92,28 @@ replacing it.
 
 ### Applying changes
 
-For each path where the index differs from the disk:
+Each apply round works out, under the state lock, what every pending path
+needs, then carries it out without the lock:
 
-1. Check that the disk still matches the local record. If the user changed
-   the file since the last scan, skip it; the next scan records their edit
-   and the merge decides.
-2. Get the content: copy it from a local file with the same hash (renames,
-   duplicates), or fetch it from a peer that announced this entry.
-3. Write it to a temporary file in `.syncer/tmp` (same file system as the
-   target), check its hash, fsync, check the disk record again, and rename it
-   over the target. A partial download stays there and the next attempt
-   resumes from its end.
+1. **Stage.** The content every placement needs is put in `.syncer/tmp`
+   (same file system as the folder) before any file changes: content
+   already downloaded is there, content another file here holds is copied
+   from it and checked against its hash. So a conflict copy can never lose
+   the content it is made from to the overwrite of the original, whatever
+   order the two are worked on, and a renamed file is copied, not fetched.
+2. **Place.** For each path, check that the disk still matches the local
+   record. If the user changed the file since the last scan, skip it; the
+   next scan records their edit and the merge decides. Otherwise give the
+   staged content its mode and mtime, fsync it, and rename it over the path.
+3. **Remove.** Deletions go last. A deletion that leaves a directory empty
+   removes the directory. Empty directories are not synced.
+4. **Settle.** A path leaves the pending list only if its index entry is
+   still the one the work was planned for. An entry that changed while the
+   round ran keeps the path pending for the next round.
 
-Creations and updates go before deletions, so a renamed file is copied from
-its old path before that path is removed. A deletion that leaves a directory
-empty removes the directory. Empty directories are not synced.
+Content no file here has is fetched from a peer that holds the folder, into
+a partial file in `.syncer/tmp` that the next attempt resumes. It counts only
+once its blake3 hash matches. Content waiting there is served to peers too.
 
 On case-insensitive file systems a new path whose name differs only by case
 from an existing one is refused and reported, never written over it.
@@ -127,7 +134,9 @@ pull from it from zero.
 ### Scanning and watching
 
 A scan walks the folder with the rules below, compares stat data with the
-local record, and hashes what changed. File system events trigger scans of
+local record, and hashes what changed. A directory that cannot be listed
+protects everything under it, the root included: nothing in it counts as
+deleted. A file that cannot be read is tried again on a slow timer. File system events trigger scans of
 the paths they name, debounced. A full scan runs at start and every ten
 minutes, and whenever the watcher reports an overflow.
 
@@ -215,11 +224,22 @@ become unstaged. Their content stays in the working tree.
 ### Keeping working trees coherent
 
 File changes from a peer are only accepted while both devices have the same
-commit checked out. Otherwise the pull pauses and retries once Git has caught
-up. In the common case Git catches up in a moment by fast-forwarding. When
+commit checked out. Otherwise the pull holds back: it skips the peer's file
+batches without moving its cursor, keeps following the peer's Git state, and
+tries Git alignment again every few seconds (a repository busy with another
+Git command is skipped, not waited on). As soon as the two checkouts match,
+it pulls again from its cursor.
+
+Git is read before a scan's new entries are announced, so every batch
+carries the commit its changes were made on.
+
+In the common case Git catches up in a moment by fast-forwarding. When
 branches have diverged the folder waits for the user to merge, so the working
 trees of two different histories never get mixed together. `syncer status`
 says which branch diverged with which device and how to merge.
+
+A folder whose root `.git` is a file (a linked worktree or a submodule) is
+not synced; sync the main checkout instead.
 
 ### Starting a new device
 
@@ -264,6 +284,11 @@ Two ALPNs:
 - `syncer/1`: everything between members. Each bi-stream starts with a
   request: `Cluster`, `Pull`, `Get` (file content, resumable by offset),
   `Pack` (Git objects).
+
+Paths from peers are checked before anything is merged: relative, no `..`,
+no control characters, nothing that names `.git` on any file system (`.git`
+in any case, `.git.` and `.git ` which Windows reads as `.git`, `GIT~1`),
+and on Windows no device names, streams or names Windows would change.
 
 Messages are length-prefixed MessagePack. File content and packs travel as a
 sequence of chunk messages. The receiver verifies every file against its

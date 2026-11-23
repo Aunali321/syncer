@@ -34,7 +34,10 @@ const UNWATCHED_SCAN: Duration = Duration::from_secs(60);
 const RETRY: Duration = Duration::from_secs(30);
 const SAVE: Duration = Duration::from_secs(5);
 /// Downloads in flight at once.
-const PARALLEL_FETCHES: usize = 4;
+const PARALLEL_FETCHES: usize = 8;
+/// How long an apply round waits for more downloads to finish, so a burst
+/// of small files is placed in a few rounds rather than one each.
+const GATHER: Duration = Duration::from_millis(250);
 
 /// What the watcher reports.
 enum Event {
@@ -87,6 +90,10 @@ pub async fn run(node: Arc<Node>, folder: Arc<Folder>, mut peers: watch::Receive
     let mut fetches: JoinSet<(Hash, anyhow::Result<()>)> = JoinSet::new();
     let mut in_flight: HashSet<Hash> = HashSet::new();
     let mut queued: Vec<(Hash, String)> = Vec::new();
+    // When the next apply round runs; rounds gather what arrives meanwhile.
+    let mut apply_at: Option<Instant> = None;
+    // Paths that could not be read, looked at again on the retry timer.
+    let mut unsettled: BTreeSet<String> = BTreeSet::new();
 
     // The first tick of an interval is immediate: it is the scan at start.
     retry.tick().await;
@@ -102,13 +109,19 @@ pub async fn run(node: Arc<Node>, folder: Arc<Folder>, mut peers: watch::Receive
                 let git = due.git;
                 due = Due::default();
                 if paths_changed {
-                    scan(&folder, scope, &mut due).await;
+                    scan(&folder, scope, &mut unsettled).await;
                 } else if git {
                     folder.observe_git().await;
                 }
             }
-            _ = full_scan.tick() => scan(&folder, Scope::All, &mut due).await,
-            () = folder.work.notified() => apply(&folder, &mut queued).await,
+            _ = full_scan.tick() => scan(&folder, Scope::All, &mut unsettled).await,
+            () = folder.work.notified() => {
+                apply_at.get_or_insert_with(|| Instant::now() + GATHER);
+            }
+            () = sleep_until(apply_at.unwrap_or_else(far_future)), if apply_at.is_some() => {
+                apply_at = None;
+                apply(&folder, &mut queued).await;
+            }
             Some(joined) = fetches.join_next() => {
                 if let Ok((hash, result)) = joined {
                     in_flight.remove(&hash);
@@ -119,6 +132,9 @@ pub async fn run(node: Arc<Node>, folder: Arc<Folder>, mut peers: watch::Receive
                 }
             }
             _ = retry.tick() => {
+                if !unsettled.is_empty() {
+                    due.add(Event::Paths(std::mem::take(&mut unsettled).into_iter().collect()));
+                }
                 folder.drop_unwanted_downloads();
                 folder.work.notify_one();
             }
@@ -157,13 +173,12 @@ pub async fn run(node: Arc<Node>, folder: Arc<Folder>, mut peers: watch::Receive
     }
 }
 
-async fn scan(folder: &Arc<Folder>, scope: Scope, due: &mut Due) {
+/// Scans `scope`. Paths that could not be read (being written, or not
+/// readable) join `unsettled`, for the retry timer: a file that stays
+/// unreadable is not scanned over and over.
+async fn scan(folder: &Arc<Folder>, scope: Scope, unsettled: &mut BTreeSet<String>) {
     match folder.scan(scope).await {
-        Ok(again) => {
-            if !again.is_empty() {
-                due.add(Event::Paths(again));
-            }
-        }
+        Ok(again) => unsettled.extend(again),
         Err(e) => tracing::warn!("{}: {e:#}", folder.id),
     }
 }

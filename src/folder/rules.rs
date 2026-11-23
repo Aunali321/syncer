@@ -16,6 +16,11 @@ use std::{
 /// The ignore file syncer reads, in `.gitignore` syntax.
 pub const IGNORE_FILE: &str = ".syncerignore";
 
+/// Whether `path` is a file whose edit changes the rules.
+pub fn is_rule_file(path: &str) -> bool {
+    matches!(path.rsplit('/').next(), Some(".gitignore" | IGNORE_FILE))
+}
+
 /// The ignore files of one directory.
 #[derive(Default)]
 struct DirRules {
@@ -60,7 +65,9 @@ impl Rules {
         if parts
             .first()
             .is_some_and(|first| first.eq_ignore_ascii_case(OWN_DIR))
-            || parts.iter().any(|part| part.eq_ignore_ascii_case(".git"))
+            || parts
+                .iter()
+                .any(|part| crate::folder::index::is_git_name(part))
         {
             return true;
         }

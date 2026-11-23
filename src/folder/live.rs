@@ -6,8 +6,8 @@
 use crate::{
     folder::{
         OWN_DIR, disk,
-        index::{Entry, FileMeta, Hash, Kind, Replica},
-        rules::Rules,
+        index::{Entry, FileMeta, Hash, Kind, Replica, Version},
+        rules::{Rules, is_rule_file},
         scan::{self, Scope},
         state::{Cursor, State, Work},
     },
@@ -76,6 +76,8 @@ pub struct Round {
     pub fetch: Vec<(Hash, String)>,
     /// Paths that failed and wait for the next round.
     pub failed: usize,
+    /// An ignore file was written or removed.
+    pub rules_changed: bool,
 }
 
 /// Content to send to a peer.
@@ -125,6 +127,12 @@ impl Folder {
         };
 
         check_root(&id, root, state.has_history())?;
+        if root.join(".git").is_file() {
+            bail!(
+                "{} is a linked worktree or a submodule; sync its main checkout instead",
+                root.display()
+            );
+        }
         let own = root.join(OWN_DIR);
         fs::create_dir_all(own.join(TMP)).with_context(|| format!("making {}", own.display()))?;
         clean_tmp(&own.join(TMP));
@@ -244,10 +252,22 @@ impl Folder {
         })
         .await?;
 
-        let again = lock(&self.state).apply_scan(read, plan.gone, plan.excluded);
+        let rules_changed = read.iter().any(|(to_read, _)| is_rule_file(&to_read.path))
+            || plan.gone.iter().any(|gone| is_rule_file(&gone.path));
+        let again = {
+            let mut state = lock(&self.state);
+            let again = state.apply_scan(read, plan.gone, plan.excluded);
+            if rules_changed {
+                // Paths the old rules left out may sync now, and the reverse.
+                state.pend_all();
+            }
+            again
+        };
+        // Git first: batches carry the commit the checkout is at, so it must
+        // be read before the new entries are announced.
+        self.observe_git_locked().await;
         self.changed();
         self.work.notify_one();
-        self.observe_git_locked().await;
         Ok(again)
     }
 
@@ -325,6 +345,9 @@ impl Folder {
         let (repo, wants, haves) = spawn_blocking(move || {
             let repo = match Repo::open(&root) {
                 Some(repo) => repo,
+                None if fs::symlink_metadata(root.join(".git")).is_ok() => {
+                    bail!("the folder's .git is not a repository directory here")
+                }
                 None if peer_state.head.is_some() => git::sync::bootstrap(&root, &peer_state)?,
                 None => bail!("the peer's folder has no repository"),
             };
@@ -446,146 +469,120 @@ impl Folder {
         let _disk = self.disk_lock.lock().await;
         check_root(&self.id, &self.root, true)?;
         let rules = lock(&self.rules).clone();
-        let work: Vec<(String, Work)> = {
-            let state = lock(&self.state);
-            state
-                .pending()
-                .iter()
-                .map(|path| (path.clone(), state.work(path, &rules)))
-                .collect()
-        };
         let mut round = Round::default();
-        let mut removals = Vec::new();
+        let mut jobs = Vec::new();
 
-        for (path, work) in work {
-            match work {
-                Work::Done => {
-                    lock(&self.state).settle(&path);
-                    lock(&self.problems).files.remove(&path);
-                }
-                Work::Adopt(version) => {
-                    let mut state = lock(&self.state);
-                    state.adopted(&path, version);
-                    state.settle(&path);
-                    round.done += 1;
-                }
-                Work::Remove { version, expected } => removals.push((path, version, expected)),
-                Work::Place {
-                    entry,
-                    meta,
-                    expected,
-                } => match self.place(&path, &entry, &meta, expected).await {
-                    Ok(true) => {
-                        round.done += 1;
+        {
+            let mut state = lock(&self.state);
+            let pending: Vec<String> = state.pending().iter().cloned().collect();
+
+            for path in pending {
+                let planned = state.index.get(&path).map(|entry| entry.version.clone());
+                match state.work(&path, &rules) {
+                    Work::Done => {
+                        state.settle(&path, planned.as_ref());
                         lock(&self.problems).files.remove(&path);
                     }
-                    Ok(false) => round.fetch.push((meta.hash, path)),
-                    Err(e) => {
-                        round.failed += 1;
-                        lock(&self.problems).files.insert(path, format!("{e:#}"));
+                    Work::Adopt(version) => {
+                        state.adopted(&path, version);
+                        state.settle(&path, planned.as_ref());
+                        round.done += 1;
                     }
-                },
+                    Work::Place {
+                        entry,
+                        meta,
+                        expected,
+                    } => {
+                        if expected.is_none()
+                            && self.case_insensitive
+                            && let Some(other) = state.disk.case_clash(&path)
+                        {
+                            let why = format!(
+                                "{other} is already here, and this file system does not tell the two names apart"
+                            );
+                            lock(&self.problems).files.insert(path, why);
+                            round.failed += 1;
+                            continue;
+                        }
+                        let source = state.disk.holding(&meta.hash, &path).map(|(at, file)| {
+                            (disk::join(&self.root, at), file.stat, file.meta.kind)
+                        });
+                        jobs.push(Job::Place {
+                            path,
+                            version: entry.version,
+                            meta,
+                            expected,
+                            source,
+                        });
+                    }
+                    Work::Remove { version, expected } => jobs.push(Job::Remove {
+                        path,
+                        version,
+                        expected,
+                    }),
+                }
             }
         }
 
-        // After creations, so a renamed file is copied before its old path goes.
-        for (path, version, expected) in removals {
-            let (root, at) = (self.root.clone(), path.clone());
-            match spawn_blocking(move || disk::remove(&root, &at, &expected)).await? {
-                Ok(()) => {
-                    let mut state = lock(&self.state);
-                    state.removed(&path);
-                    state.settle(&path);
-                    drop(state);
-                    round.done += 1;
-                    lock(&self.problems).files.remove(&path);
-                    tracing::debug!("{}: removed {path} ({version:?})", self.id);
-                }
-                Err(e) => {
-                    round.failed += 1;
-                    lock(&self.problems).files.insert(path, format!("{e:#}"));
+        let (root, tmp) = (self.root.clone(), self.tmp());
+        let outcomes = spawn_blocking(move || run_jobs(&root, &tmp, jobs)).await?;
+        let again = {
+            let mut state = lock(&self.state);
+            let mut problems = lock(&self.problems);
+
+            for (path, outcome) in outcomes {
+                match outcome {
+                    Outcome::Placed {
+                        meta,
+                        stat,
+                        version,
+                    } => {
+                        state.placed(&path, meta, stat, version.clone());
+                        state.settle(&path, Some(&version));
+                        round.done += 1;
+                        round.rules_changed |= is_rule_file(&path);
+                        problems.files.remove(&path);
+                    }
+                    Outcome::Removed { version } => {
+                        state.removed(&path);
+                        state.settle(&path, Some(&version));
+                        round.done += 1;
+                        round.rules_changed |= is_rule_file(&path);
+                        problems.files.remove(&path);
+                    }
+                    Outcome::Missing(hash) => round.fetch.push((hash, path)),
+                    Outcome::Failed(why) => {
+                        round.failed += 1;
+                        problems.files.insert(path, why);
+                    }
                 }
             }
-        }
+
+            // Paths whose index entry moved while the round ran are still pending.
+            state.pending().iter().any(|path| {
+                !round.fetch.iter().any(|(_, wanted)| wanted == path)
+                    && !problems.files.contains_key(path)
+            })
+        };
 
         if round.done > 0 {
             self.dirty.store(true, Ordering::Release);
         }
 
+        if round.rules_changed {
+            let (root, use_gitignore) = (self.root.clone(), self.settings.use_gitignore);
+            let rules = spawn_blocking(move || Arc::new(Rules::new(&root, use_gitignore))).await?;
+            *lock(&self.rules) = rules;
+            lock(&self.state).pend_all();
+        }
+
+        if round.rules_changed || (again && round.done > 0) {
+            self.work.notify_one();
+        }
+
         round.fetch.sort();
         round.fetch.dedup_by(|a, b| a.0 == b.0);
         Ok(round)
-    }
-
-    /// Places `meta`'s content at `path` if it is at hand: downloaded, or in
-    /// another file here. Returns `false` when it must be fetched first.
-    async fn place(
-        self: &Arc<Self>,
-        path: &str,
-        entry: &Entry,
-        meta: &FileMeta,
-        expected: Option<disk::Stat>,
-    ) -> Result<bool> {
-        if expected.is_none()
-            && self.case_insensitive
-            && let Some(other) = lock(&self.state).disk.case_clash(path)
-        {
-            bail!(
-                "{other} is already here, and this file system does not tell the two names apart"
-            );
-        }
-
-        let (_, done) = self.download_paths(&meta.hash);
-        let source = lock(&self.state)
-            .disk
-            .holding(&meta.hash, path)
-            .map(|(at, file)| (disk::join(&self.root, at), file.stat, file.meta.kind));
-        let (root, path_owned, meta_owned) = (self.root.clone(), path.to_owned(), meta.clone());
-
-        let placed = spawn_blocking(move || -> Result<Option<disk::Stat>> {
-            let content = done.with_extension("place");
-
-            if done.exists() {
-                fs::copy(&done, &content).context("copying downloaded content")?;
-            } else if let Some((from, stat, kind)) = source {
-                if !disk::unchanged(&from, Some(&stat))? {
-                    return Ok(None);
-                }
-                match kind {
-                    Kind::File => disk::copy_verified(&from, &content, &meta_owned.hash)?,
-                    Kind::Symlink => fs::write(&content, disk::link_bytes(&from)?)?,
-                }
-            } else {
-                return Ok(None);
-            }
-
-            let staged = if meta_owned.kind == Kind::Symlink {
-                let target = fs::read(&content)?;
-                let link = content.with_extension("link");
-                let _ = fs::remove_file(&link);
-                disk::write_symlink(&link, &target)?;
-                fs::remove_file(&content)?;
-                link
-            } else {
-                content
-            };
-
-            let result = disk::place(&root, &path_owned, &staged, &meta_owned, expected.as_ref());
-            if result.is_err() {
-                let _ = fs::remove_file(&staged);
-            }
-            result.map(Some)
-        })
-        .await??;
-
-        let Some(stat) = placed else {
-            return Ok(false);
-        };
-        let mut state = lock(&self.state);
-        state.placed(path, meta.clone(), stat, entry.version.clone());
-        state.settle(path);
-        tracing::debug!("{}: placed {path}", self.id);
-        Ok(true)
     }
 
     /// Drops downloaded content once no pending path wants it.
@@ -625,7 +622,12 @@ impl Folder {
             .holding(hash, path)
             .map(|(at, file)| (disk::join(&self.root, at), file.stat));
         let Some((at, stat)) = found else {
-            return Ok(None);
+            // Verified content waiting to be placed is as good.
+            let (_, staged) = self.download_paths(hash);
+            return Ok(fs::symlink_metadata(&staged)
+                .ok()
+                .and_then(|meta| disk::Stat::of(&meta))
+                .map(|stat| Content::File { path: staged, stat }));
         };
 
         if !disk::unchanged(&at, Some(&stat))? {
@@ -677,6 +679,171 @@ pub struct Summary {
     pub conflicts: Vec<String>,
     pub head: Option<git::HeadTarget>,
     pub head_commit: Option<git::Oid>,
+}
+
+/// A change to the disk, worked out under the state lock and carried out
+/// without it.
+enum Job {
+    Place {
+        path: String,
+        version: Version,
+        meta: FileMeta,
+        expected: Option<disk::Stat>,
+        /// A file here with the same content, to copy from.
+        source: Option<(PathBuf, disk::Stat, Kind)>,
+    },
+    Remove {
+        path: String,
+        version: Version,
+        expected: disk::Stat,
+    },
+}
+
+enum Outcome {
+    Placed {
+        meta: FileMeta,
+        stat: disk::Stat,
+        version: Version,
+    },
+    Removed {
+        version: Version,
+    },
+    /// The content is not here: fetch it.
+    Missing(Hash),
+    Failed(String),
+}
+
+/// Carries out a round's jobs. Every placement's content is staged in `tmp`
+/// before any file changes, so content one path still needs is never lost to
+/// another path's overwrite (a conflict copy and the file it was taken from,
+/// say). Removals go last, so a renamed file is copied before its old path
+/// goes. Everything here blocks.
+fn run_jobs(root: &Path, tmp: &Path, jobs: Vec<Job>) -> Vec<(String, Outcome)> {
+    let mut uses: std::collections::HashMap<Hash, usize> = std::collections::HashMap::new();
+
+    for job in &jobs {
+        if let Job::Place { meta, source, .. } = job {
+            *uses.entry(meta.hash).or_default() += 1;
+            let staged = tmp.join(meta.hash.to_string());
+            if !staged.exists()
+                && let Some((from, stat, kind)) = source
+                && let Err(e) = stage(from, stat, *kind, &meta.hash, &staged)
+            {
+                tracing::debug!("staging {}: {e:#}", from.display());
+            }
+        }
+    }
+
+    let mut outcomes = Vec::with_capacity(jobs.len());
+    let mut removals = Vec::new();
+
+    for job in jobs {
+        match job {
+            Job::Place {
+                path,
+                version,
+                meta,
+                expected,
+                ..
+            } => {
+                let staged = tmp.join(meta.hash.to_string());
+                let outcome = if staged.exists() {
+                    let last = uses.get_mut(&meta.hash).map(|count| {
+                        *count -= 1;
+                        *count == 0
+                    });
+                    match place_staged(
+                        root,
+                        &path,
+                        &staged,
+                        &meta,
+                        expected.as_ref(),
+                        last == Some(true),
+                    ) {
+                        Ok(stat) => Outcome::Placed {
+                            meta,
+                            stat,
+                            version,
+                        },
+                        Err(e) => Outcome::Failed(format!("{e:#}")),
+                    }
+                } else {
+                    Outcome::Missing(meta.hash)
+                };
+                outcomes.push((path, outcome));
+            }
+            Job::Remove {
+                path,
+                version,
+                expected,
+            } => removals.push((path, version, expected)),
+        }
+    }
+
+    for (path, version, expected) in removals {
+        let outcome = match disk::remove(root, &path, &expected) {
+            Ok(()) => Outcome::Removed { version },
+            Err(e) => Outcome::Failed(format!("{e:#}")),
+        };
+        outcomes.push((path, outcome));
+    }
+
+    outcomes
+}
+
+/// Copies content from a file here into `staged`, checking its hash.
+fn stage(from: &Path, stat: &disk::Stat, kind: Kind, hash: &Hash, staged: &Path) -> Result<()> {
+    if !disk::unchanged(from, Some(stat))? {
+        bail!("changed since it was scanned");
+    }
+    let partial = staged.with_extension("stage");
+    match kind {
+        Kind::File => disk::copy_verified(from, &partial, hash)?,
+        Kind::Symlink => {
+            let bytes = disk::link_bytes(from)?;
+            if Hash::of(&bytes) != *hash {
+                bail!("the link changed since it was scanned");
+            }
+            fs::write(&partial, bytes)?;
+        }
+    }
+    fs::rename(&partial, staged)?;
+    Ok(())
+}
+
+/// Places staged content at `path`. The staged copy is moved on its last
+/// use and copied before that; it stays when placement fails.
+fn place_staged(
+    root: &Path,
+    path: &str,
+    staged: &Path,
+    meta: &FileMeta,
+    expected: Option<&disk::Stat>,
+    last_use: bool,
+) -> Result<disk::Stat> {
+    let content = staged.with_extension("place");
+
+    if meta.kind == Kind::Symlink {
+        let target = fs::read(staged)?;
+        let _ = fs::remove_file(&content);
+        disk::write_symlink(&content, &target)?;
+    } else if last_use {
+        fs::rename(staged, &content)?;
+    } else {
+        fs::copy(staged, &content).context("copying staged content")?;
+    }
+
+    let placed = disk::place(root, path, &content, meta, expected);
+    if placed.is_err() {
+        if meta.kind == Kind::File && last_use {
+            let _ = fs::rename(&content, staged);
+        } else {
+            let _ = fs::remove_file(&content);
+        }
+    } else if meta.kind == Kind::Symlink && last_use {
+        let _ = fs::remove_file(staged);
+    }
+    placed
 }
 
 /// Checks that `root` is this folder: it exists and carries the marker. A
@@ -743,4 +910,127 @@ fn probe_case(dir: &Path) -> bool {
     let insensitive = dir.join("CASE-PROBE").exists();
     let _ = fs::remove_file(&probe);
     insensitive
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::folder::index::Version;
+
+    fn folder(root: &Path) -> Arc<Folder> {
+        let state = root.join("state");
+        Folder::open(
+            FolderId::random(),
+            &root.join("work"),
+            &state,
+            [7; 32],
+            Settings::default(),
+        )
+        .expect("the folder opens")
+    }
+
+    fn meta(text: &str, mtime_ms: i64) -> FileMeta {
+        FileMeta {
+            kind: Kind::File,
+            hash: Hash::of(text.as_bytes()),
+            size: text.len() as u64,
+            mtime_ms,
+            executable: false,
+        }
+    }
+
+    /// Makes `text` downloaded content, as a fetch would.
+    fn download(folder: &Folder, text: &str) {
+        let (_, done) = folder.download_paths(&Hash::of(text.as_bytes()));
+        fs::write(done, text).expect("write");
+    }
+
+    #[tokio::test]
+    async fn a_losing_local_edit_survives_as_its_conflict_copy() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let folder = folder(dir.path());
+        // `Makefile` sorts before `Makefile (conflict ...)`: the original is
+        // worked on first, and its local content must already be staged.
+        fs::write(folder.root().join("Makefile"), "local").expect("write");
+        folder.scan(Scope::All).await.expect("scanned");
+
+        let theirs = Entry {
+            path: "Makefile".into(),
+            version: Version::default().with(99, 1),
+            file: Some(meta("theirs", i64::MAX / 2)),
+        };
+        download(&folder, "theirs");
+        folder.merge(
+            &iroh::SecretKey::from_bytes(&[1; 32]).public(),
+            &[theirs],
+            Default::default(),
+        );
+        folder.apply().await.expect("applied");
+
+        let copy = crate::folder::index::conflict_path("Makefile", &Hash::of(b"local"));
+        assert_eq!(
+            fs::read_to_string(folder.root().join("Makefile")).expect("read"),
+            "theirs"
+        );
+        assert_eq!(
+            fs::read_to_string(folder.root().join(&copy)).expect("the copy"),
+            "local"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_path_whose_entry_moves_during_a_round_stays_pending() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let folder = folder(dir.path());
+        let peer = iroh::SecretKey::from_bytes(&[1; 32]).public();
+        let first = Entry {
+            path: "a".into(),
+            version: Version::default().with(99, 1),
+            file: Some(meta("one", 1)),
+        };
+        folder.merge(&peer, std::slice::from_ref(&first), Default::default());
+        download(&folder, "one");
+
+        // The round places `one`; a newer entry arrives before it settles.
+        let round = folder.apply().await.expect("applied");
+        assert_eq!(round.done, 1);
+        let second = Entry {
+            path: "a".into(),
+            version: first.version.with(99, 2),
+            file: Some(meta("two", 2)),
+        };
+        lock(&folder.state).settle("a", Some(&first.version));
+        folder.merge(&peer, &[second], Default::default());
+        lock(&folder.state).settle("a", Some(&first.version));
+        assert!(lock(&folder.state).pending().contains("a"));
+
+        download(&folder, "two");
+        folder.apply().await.expect("applied");
+        assert_eq!(
+            fs::read_to_string(folder.root().join("a")).expect("read"),
+            "two"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_folder_without_its_marker_is_left_alone() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let folder = folder(dir.path());
+        fs::write(folder.root().join("a"), "keep").expect("write");
+        folder.scan(Scope::All).await.expect("scanned");
+        folder.save().await.expect("saved");
+        let id = folder.id.clone();
+        drop(folder);
+
+        fs::remove_dir_all(dir.path().join("work")).expect("unmounted");
+        fs::create_dir(dir.path().join("work")).expect("an empty mount point");
+        let reopened = Folder::open(
+            id,
+            &dir.path().join("work"),
+            &dir.path().join("state"),
+            [7; 32],
+            Settings::default(),
+        );
+        assert!(reopened.is_err());
+    }
 }

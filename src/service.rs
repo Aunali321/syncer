@@ -382,6 +382,10 @@ impl Service {
     /// Stops syncing a folder here; its files stay. With `everywhere`, the
     /// folder leaves the cluster for every device.
     pub fn remove_folder(&self, id: &FolderId, everywhere: bool) -> Result<()> {
+        // Stopped here, without the save a stop otherwise makes, so the state
+        // removed below does not come back.
+        let running = lock(&self.folders).remove(id);
+        drop(running);
         self.change_config(|config| {
             config.folders.remove(id);
         })?;

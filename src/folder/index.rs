@@ -250,8 +250,35 @@ pub fn is_conflict(path: &str) -> bool {
 /// The longest path a peer may name.
 const MAX_PATH: usize = 4096;
 
+/// Whether `part` names a `.git` directory on some file system: `.git` in
+/// any case, with the trailing dots and spaces Windows drops, or its short
+/// name.
+pub fn is_git_name(part: &str) -> bool {
+    let trimmed = part.trim_end_matches(['.', ' ']);
+    trimmed.eq_ignore_ascii_case(".git") || part.eq_ignore_ascii_case("git~1")
+}
+
+/// Whether Windows refuses `part` as a file name or reads it as something
+/// else: a device name, a stream, a name ending in a dot or space.
+fn windows_refuses(part: &str) -> bool {
+    const DEVICES: [&str; 22] = [
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ];
+    let stem = part
+        .split('.')
+        .next()
+        .unwrap_or(part)
+        .trim_end()
+        .to_ascii_lowercase();
+    part.contains([':', '<', '>', '"', '|', '?', '*'])
+        || part.ends_with(['.', ' '])
+        || DEVICES.contains(&stem.as_str())
+}
+
 /// Whether a peer may name `path`: plain names joined with `/`, none of them
-/// `.git` in any case, and not syncer's own folder at the root.
+/// `.git` in any spelling, and not syncer's own folder at the root. On
+/// Windows, also no name Windows would read as something else.
 pub fn valid_path(path: &str) -> bool {
     !path.is_empty()
         && path.len() <= MAX_PATH
@@ -264,7 +291,9 @@ pub fn valid_path(path: &str) -> bool {
                 && part != "."
                 && part != ".."
                 && !part.contains(['\\', '\0'])
-                && !part.eq_ignore_ascii_case(".git")
+                && !part.chars().any(char::is_control)
+                && !is_git_name(part)
+                && !(cfg!(windows) && windows_refuses(part))
         })
 }
 
@@ -678,6 +707,9 @@ mod tests {
     fn paths_from_peers_are_checked() {
         assert!(valid_path("src/main.rs"));
         assert!(valid_path("a/.gitignore"));
+        assert!(
+            windows_refuses("aux.c") && windows_refuses("a:b") && !windows_refuses("auxiliary")
+        );
         for bad in [
             "",
             "/a",
@@ -688,8 +720,14 @@ mod tests {
             ".GIT",
             "a\\b",
             ".syncer/folder",
+            ".git./hooks/post-checkout",
+            "a/.Git /config",
+            "GIT~1/config",
+            "a\u{7}b",
         ] {
             assert!(!valid_path(bad), "{bad}");
         }
+        assert!(windows_refuses("aux.c") && windows_refuses("a:b") && windows_refuses("x."));
+        assert!(!windows_refuses("auxiliary.rs") && !windows_refuses(".gitignore"));
     }
 }

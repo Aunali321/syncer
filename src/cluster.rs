@@ -112,6 +112,10 @@ impl Cluster {
             let mine = self.state.members.entry(folder.clone()).or_default();
             for (device, record) in members {
                 seen = seen.max(record.stamp.lamport);
+                // Only a device says what it holds.
+                if record.stamp.by != *device {
+                    continue;
+                }
                 if let Some(newer) = merge_one(&mut mine.get_mut(device), record) {
                     mine.insert(*device, newer);
                     changed = true;
@@ -329,6 +333,23 @@ mod tests {
         assert_eq!(cluster.find_device("desk"), Some(b));
         assert_eq!(cluster.find_device(&crate::ids::short(&b)), Some(b));
         assert_eq!(cluster.find_device("nobody"), None);
+    }
+
+    #[test]
+    fn only_a_device_says_what_it_holds() {
+        let (a, b, c) = (device(1), device(2), device(3));
+        let mut on_a = Cluster::new(a, "laptop");
+        let folder = FolderId::random();
+        let mut forged = ClusterState::default();
+        forged.members.entry(folder.clone()).or_default().insert(
+            c,
+            Lww {
+                value: true,
+                stamp: Stamp { lamport: 9, by: b },
+            },
+        );
+        on_a.merge(&forged);
+        assert!(!on_a.holds(&c, &folder));
     }
 
     #[test]

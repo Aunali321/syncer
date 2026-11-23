@@ -18,6 +18,8 @@ use tokio::time::sleep;
 
 /// The longest wait between attempts to reach a peer.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// How often a held-back pull tries Git alignment again.
+const RETRY_HELD: Duration = Duration::from_secs(15);
 
 /// Follows `peer`'s index of `folder` until the task is stopped.
 pub async fn follow(node: Arc<Node>, folder: Arc<Folder>, peer: DeviceId) {
@@ -57,6 +59,11 @@ async fn once(node: &Node, folder: &Arc<Folder>, peer: DeviceId) -> Result<()> {
     // While held, batches are skipped and the cursor stays where it was.
     let mut held = false;
     let mut peer_head: Option<Oid> = None;
+    // The peer's last Git state, aligned with again while held: an
+    // alignment skipped for a busy repository or a failed fetch is retried.
+    let mut peer_git = None;
+    let mut retry = tokio::time::interval(RETRY_HELD);
+    retry.tick().await;
 
     loop {
         let message = tokio::select! {
@@ -65,6 +72,19 @@ async fn once(node: &Node, folder: &Arc<Folder>, peer: DeviceId) -> Result<()> {
                 changed?;
                 local_git.borrow_and_update();
                 if held && folder.accepts(peer_head.as_ref()) {
+                    return Ok(());
+                }
+                continue;
+            }
+            _ = retry.tick(), if held => {
+                if let Some(state) = &peer_git
+                    && let Err(e) = folder
+                        .align_git(&peer, state, |wants, haves| fetch::pack(&connection, folder, wants, haves))
+                        .await
+                {
+                    tracing::debug!("{}: Git from {}: {e:#}", folder.id, short(&peer));
+                }
+                if folder.accepts(peer_head.as_ref()) {
                     return Ok(());
                 }
                 continue;
@@ -82,6 +102,7 @@ async fn once(node: &Node, folder: &Arc<Folder>, peer: DeviceId) -> Result<()> {
             }
             PullMessage::Git(state) => {
                 peer_head = state.head_commit.clone();
+                peer_git = Some(state.clone());
                 let aligned = folder
                     .align_git(&peer, &state, |wants, haves| {
                         fetch::pack(&connection, folder, wants, haves)

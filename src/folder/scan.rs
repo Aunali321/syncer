@@ -38,7 +38,10 @@ impl Scope {
 
 /// Whether `path` is `dir` or inside it.
 pub fn within(path: &str, dir: &str) -> bool {
-    path == dir || (path.starts_with(dir) && path.as_bytes().get(dir.len()) == Some(&b'/'))
+    // The root holds everything.
+    dir.is_empty()
+        || path == dir
+        || (path.starts_with(dir) && path.as_bytes().get(dir.len()) == Some(&b'/'))
 }
 
 pub fn walk(root: &Path, rules: &Rules, scope: &Scope) -> Walked {
@@ -172,5 +175,9 @@ mod tests {
         assert!(scope.covers("gone"));
         assert!(!scope.covers("ab"));
         assert!(!scope.covers("x"));
+        assert!(
+            within("anything/at/all", ""),
+            "an unreadable root protects everything"
+        );
     }
 }

@@ -224,7 +224,9 @@ impl State {
         self.pend_all();
     }
 
-    fn pend_all(&mut self) {
+    /// Marks every path for a look, as when the rules changed and paths
+    /// they left out may sync now.
+    pub fn pend_all(&mut self) {
         self.pending = self
             .index
             .entries()
@@ -241,8 +243,13 @@ impl State {
         self.pending.extend(paths);
     }
 
-    pub fn settle(&mut self, path: &str) {
-        self.pending.remove(path);
+    /// Takes `path` off the pending list if its index entry is still at
+    /// `planned`, the version the finished work was planned for. An entry
+    /// that moved meanwhile keeps the path pending.
+    pub fn settle(&mut self, path: &str, planned: Option<&Version>) {
+        if self.index.get(path).map(|entry| &entry.version) == planned {
+            self.pending.remove(path);
+        }
     }
 
     /// Compares a walk with the disk record.
