@@ -118,6 +118,30 @@ once its blake3 hash matches. Content waiting there is served to peers too.
 On case-insensitive file systems a new path whose name differs only by case
 from an existing one is refused and reported, never written over it.
 
+### A file and a directory at one path
+
+One device can replace the file `x` with a directory `x/` while another
+edits `x`. Both survive the merge, but no file system holds both. Whichever
+device notices first settles it: the directory wins and the file moves to a
+conflict copy beside it, recorded as an ordinary edit (the copy, then a
+deletion of `x`). Every device that notices records the same edits, so the
+indexes converge.
+
+A file is also placed where an empty directory, or a tree of nothing but
+empty directories, stands: those are left behind when a directory's files
+move away, and empty directories do not sync. A directory with any file in
+it is never removed to make room.
+
+### Content that exists nowhere
+
+A device can make a conflict copy of a version that its author overwrote
+before anyone fetched it. No device can ever fill that copy. When every
+device that holds the folder is reachable and says it does not have the
+content, twice at least half a minute apart, the copy is deleted like any
+other file. This only applies to conflict copies; a file the user named waits
+for its content however long it takes, and one unreachable device is enough
+to wait.
+
 ### Sequence numbers and pulling
 
 Every change to a device's index gets the next local sequence number. A peer
@@ -134,7 +158,9 @@ pull from it from zero.
 ### Scanning and watching
 
 A scan walks the folder with the rules below, compares stat data with the
-local record, and hashes what changed. A directory that cannot be listed
+local record (size, mtime, inode and, on Unix, the inode change time, which
+every write moves even when the writer puts the mtime back), and hashes what
+changed. A directory that cannot be listed
 protects everything under it, the root included: nothing in it counts as
 deleted. A file that cannot be read is tried again on a slow timer. File system events trigger scans of
 the paths they name, debounced. A full scan runs at start and every ten
@@ -197,9 +223,19 @@ For a tombstone `(branch, C)` a peer advertises, a local branch at `L` is
 deleted only when `L` is contained in `C`. A branch that moved on since stays
 and its tip spreads back. A branch that is checked out is never deleted.
 
+A branch that the peer has checked out, when the peer's HEAD is the newer
+one (so this device's checkout is about to follow it), is in use: it is
+created even over a tombstone, as an edit beats a delete for files.
+
 Ref updates use `git update-ref <ref> <new> <old>`, so a branch that changed
 under syncer is never overwritten. A conflict ref is removed once the local
-branch contains it, which is what happens after you merge it.
+branch contains it (you merged it), or once the peer no longer diverges at
+that tip (it merged, reset to this device's tip, or deleted the branch).
+
+A repository whose branches all vanish at once was deleted and made again,
+or replaced; Git cannot delete the branch it has checked out, so a user
+deleting branches never does that. It is not read as deletions, which would
+spread and delete every branch everywhere: Git sync starts over for it.
 
 Objects travel before refs move: the receiver asks for a pack of the wanted
 tips, the sender runs `git pack-objects --revs` excluding commits both have,
@@ -214,6 +250,10 @@ clock and the device id. When a peer's HEAD wins, the device points HEAD at
 the same branch (or commit) and refreshes the index from it. **Git never
 touches the working tree**: the files of the new checkout arrive through file
 sync, because they changed on the peer's disk when it checked out.
+
+HEAD only moves to a branch that exists here (a peer's newer HEAD on a branch
+that has not arrived waits for it), or to any branch while this repository
+has no commits at all, as a new one does.
 
 A fast-forward of the checked-out branch does the same: the ref moves, the
 index is refreshed, the files arrive (or already arrived) as files.
@@ -245,7 +285,8 @@ not synced; sync the main checkout instead.
 
 A Git folder accepted into an empty directory is created with `git init`, the
 sanitized config, every branch and tag, and the peer's HEAD. The working tree
-then arrives through file sync.
+then arrives through file sync. The same happens when `.git` is deleted on a
+device: the deletion is not mirrored, the repository comes back from a peer.
 
 ## Devices and trust
 
@@ -267,8 +308,10 @@ A small replicated map, last writer wins by `(lamport, device)`:
 - `member/<folder>/<device>`: whether that device holds the folder, written
   only by that device
 
-Members exchange the whole map whenever they connect and whenever it changes.
-Connections from devices that are not members, or were removed, are refused.
+Members exchange the whole map whenever they connect and whenever it changes;
+an exchange that fails is retried within seconds. Connections from devices
+that are not members are refused, and a device removed from the cluster
+loses every connection and pull it has open at once.
 
 ### Folder offers
 

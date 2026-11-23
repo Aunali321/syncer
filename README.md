@@ -179,9 +179,20 @@ cargo test                       # unit tests and the three-device test
 SYNCER_LOG=syncer=debug syncer run
 ```
 
-`tests/three_devices.rs` runs three real services on one machine and walks
-through pairing, branch switches, offline conflicts, diverged histories and
-an unmounted folder. `SYNCER_TEST_KEEP=1` keeps their directories and logs.
+The integration tests run real services side by side on one machine:
+
+- `tests/three_devices.rs` walks through pairing, branch switches, offline
+  conflicts, diverged histories and an unmounted folder.
+- `tests/chaos_files.rs` partitions devices and makes random edits, deletes,
+  renames and file/directory swaps on each, then checks that they converge
+  and that nothing written was lost; it also runs write storms, `kill -9`
+  mid-transfer, odd names, symlinks and modes.
+- `tests/chaos_git.rs` rewrites history, stops rebases on conflicts, detaches
+  HEAD, deletes branches in use, leaves stale locks, runs `gc`, deletes
+  `.git`, and storms commits and branch switches on three devices.
+
+`SYNCER_SEED=<n>` reruns a fuzz or storm test with the seed a failure
+printed; `SYNCER_TEST_KEEP=1` keeps the devices' directories and logs.
 
 ## License
 
