@@ -2,8 +2,12 @@
 
 pub mod disk;
 pub mod index;
+pub mod live;
 pub mod rules;
 pub mod scan;
+pub mod state;
+
+pub use live::{Folder, Settings};
 
 /// Syncer's own directory in a folder root: the folder marker and temporary
 /// files. Never synced.

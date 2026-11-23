@@ -295,10 +295,11 @@ impl Repo {
         Ok(())
     }
 
-    /// Starts `git pack-objects` for everything reachable from `wants` and not
-    /// from `haves`; its standard output is the pack. Wants and haves this
-    /// repository lacks are left out.
-    pub fn pack(&self, wants: &[Oid], haves: &[Oid]) -> Result<Child> {
+    /// The `git pack-objects` command for everything reachable from `wants`
+    /// and not from `haves`, and what to write to its standard input. Its
+    /// standard output is a thin pack. Wants and haves this repository lacks
+    /// are left out.
+    pub fn pack_command(&self, wants: &[Oid], haves: &[Oid]) -> Result<(Command, Vec<u8>)> {
         let mut revs = String::new();
 
         for want in wants {
@@ -316,33 +317,41 @@ impl Repo {
             }
         }
 
-        let mut child = self
-            .command()
+        let mut command = self.command();
+        command
             .args(["pack-objects", "--revs", "--thin", "--stdout", "--delta-base-offset", "-q"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("running git pack-objects")?;
+            .stderr(Stdio::piped());
+        Ok((command, revs.into_bytes()))
+    }
+
+    /// The `git index-pack` command that reads a thin pack on its standard
+    /// input and completes it with objects already here.
+    pub fn unpack_command(&self) -> Command {
+        let mut command = self.command();
+        command
+            .args(["index-pack", "--stdin", "--fix-thin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    /// Starts `pack_command`, feeding its input from a thread so the pipe
+    /// can never deadlock.
+    pub fn pack(&self, wants: &[Oid], haves: &[Oid]) -> Result<Child> {
+        let (mut command, input) = self.pack_command(wants, haves)?;
+        let mut child = command.spawn().context("running git pack-objects")?;
         let mut stdin = child.stdin.take().context("git pack-objects has no input")?;
-        // A few lines per ref: written before the pack is read, it never fills
-        // the pipe in practice, but a thread keeps it from ever deadlocking.
         std::thread::spawn(move || {
-            let _ = stdin.write_all(revs.as_bytes());
+            let _ = stdin.write_all(&input);
         });
         Ok(child)
     }
 
-    /// Starts `git index-pack` reading a thin pack on its standard input,
-    /// completing it with objects already here.
     pub fn unpack(&self) -> Result<Child> {
-        self.command()
-            .args(["index-pack", "--stdin", "--fix-thin"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("running git index-pack")
+        self.unpack_command().spawn().context("running git index-pack")
     }
 
     /// The repository's config as `key=value` pairs, multi-valued keys
@@ -352,9 +361,9 @@ impl Repo {
         Ok(listed
             .split('\0')
             .filter(|item| !item.is_empty())
-            .filter_map(|item| {
+            .map(|item| {
                 let (key, value) = item.split_once('\n').unwrap_or((item, ""));
-                Some((key.to_owned(), value.to_owned()))
+                (key.to_owned(), value.to_owned())
             })
             .collect())
     }

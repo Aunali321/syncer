@@ -560,9 +560,9 @@ mod tests {
             let mut changed = false;
             for from in 0..4 {
                 let (sent, _) = replicas[from].since(0, usize::MAX);
-                for to in 0..4 {
+                for replica in &mut replicas {
                     for entry in &sent {
-                        changed |= !replicas[to].merge(entry).is_empty();
+                        changed |= !replica.merge(entry).is_empty();
                     }
                 }
             }

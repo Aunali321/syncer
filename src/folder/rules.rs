@@ -103,7 +103,7 @@ impl Rules {
     }
 
     fn dir(&self, dir: &str) -> Arc<DirRules> {
-        if let Some(rules) = crate::lock(&self.dirs).get(dir) {
+        if let Some(rules) = crate::util::lock(&self.dirs).get(dir) {
             return rules.clone();
         }
 
@@ -119,19 +119,19 @@ impl Rules {
                 .then(|| read(&path, &path.join(".gitignore")))
                 .flatten(),
         });
-        crate::lock(&self.dirs).insert(dir.to_owned(), rules.clone());
+        crate::util::lock(&self.dirs).insert(dir.to_owned(), rules.clone());
         rules
     }
 
     /// Whether the directory `dir` holds its own repository: a submodule or a
     /// nested clone, which stays on its machine.
     fn is_nested_repo(&self, dir: &str) -> bool {
-        if let Some(&nested) = crate::lock(&self.nested_git).get(dir) {
+        if let Some(&nested) = crate::util::lock(&self.nested_git).get(dir) {
             return nested;
         }
 
         let nested = std::fs::symlink_metadata(self.root.join(dir).join(".git")).is_ok();
-        crate::lock(&self.nested_git).insert(dir.to_owned(), nested);
+        crate::util::lock(&self.nested_git).insert(dir.to_owned(), nested);
         nested
     }
 }
