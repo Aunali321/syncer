@@ -58,6 +58,8 @@ impl Default for Settings {
 /// Where a folder stands, for `syncer status`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Problems {
+    /// Why the whole folder is stopped, if it is: a missing marker, say.
+    pub folder: Option<String>,
     /// Paths that could not be brought in line, with why.
     pub files: BTreeMap<String, String>,
     /// Notes from Git sync with each peer: diverged branches, operations
@@ -163,6 +165,14 @@ impl Folder {
         }))
     }
 
+    /// Checks the folder is still there and still this folder, noting why
+    /// not for the status.
+    fn check(&self) -> Result<()> {
+        let checked = check_root(&self.id, &self.root, true);
+        lock(&self.problems).folder = checked.as_ref().err().map(|e| format!("{e:#}"));
+        checked
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }
@@ -227,7 +237,7 @@ impl Folder {
     /// Returns paths that were changing while read, to look at again soon.
     pub async fn scan(self: &Arc<Self>, scope: Scope) -> Result<Vec<String>> {
         let _disk = self.disk_lock.lock().await;
-        check_root(&self.id, &self.root, true)?;
+        self.check()?;
 
         let root = self.root.clone();
         let settings = self.settings;
@@ -342,17 +352,21 @@ impl Folder {
         let _disk = self.disk_lock.lock().await;
         let root = self.root.clone();
         let peer_state = theirs.clone();
-        let (repo, wants, haves) = spawn_blocking(move || {
+        let (repo, wants, haves, bootstrapped) = spawn_blocking(move || {
+            let mut bootstrapped = false;
             let repo = match Repo::open(&root) {
                 Some(repo) => repo,
                 None if fs::symlink_metadata(root.join(".git")).is_ok() => {
                     bail!("the folder's .git is not a repository directory here")
                 }
-                None if peer_state.head.is_some() => git::sync::bootstrap(&root, &peer_state)?,
+                None if peer_state.head.is_some() => {
+                    bootstrapped = true;
+                    git::sync::bootstrap(&root, &peer_state)?
+                }
                 None => bail!("the peer's folder has no repository"),
             };
             let (wants, haves) = git::sync::wants(&repo, &peer_state)?;
-            anyhow::Ok((repo, wants, haves))
+            anyhow::Ok((repo, wants, haves, bootstrapped))
         })
         .await??;
 
@@ -362,7 +376,12 @@ impl Folder {
                 .context("fetching Git objects")?;
         }
 
-        let mut memory = lock(&self.state).git.clone();
+        // A repository made just now remembers nothing of the one before.
+        let mut memory = if bootstrapped {
+            git::Memory::default()
+        } else {
+            lock(&self.state).git.clone()
+        };
         let (label, me, theirs) = (git::sync::label(peer.as_bytes()), self.me, theirs.clone());
         let (memory, state, aligned) = spawn_blocking(move || {
             git::sync::observe(&repo, &mut memory, me)?;
@@ -467,13 +486,17 @@ impl Folder {
     /// and lists the content to fetch.
     pub async fn apply(self: &Arc<Self>) -> Result<Round> {
         let _disk = self.disk_lock.lock().await;
-        check_root(&self.id, &self.root, true)?;
+        self.check()?;
         let rules = lock(&self.rules).clone();
         let mut round = Round::default();
         let mut jobs = Vec::new();
 
         {
             let mut state = lock(&self.state);
+            if !state.resolve_clashes().is_empty() {
+                self.dirty.store(true, Ordering::Release);
+                self.seq.send_replace(state.index.seq());
+            }
             let pending: Vec<String> = state.pending().iter().cloned().collect();
 
             for path in pending {
@@ -576,13 +599,48 @@ impl Folder {
             lock(&self.state).pend_all();
         }
 
-        if round.rules_changed || (again && round.done > 0) {
+        // A placement can wait on a removal in the same round (a file where
+        // a directory goes, or the reverse): go again while rounds progress.
+        if round.rules_changed || (round.done > 0 && (again || round.failed > 0)) {
             self.work.notify_one();
         }
 
         round.fetch.sort();
         round.fetch.dedup_by(|a, b| a.0 == b.0);
         Ok(round)
+    }
+
+    /// Gives up on conflict copies of content no device has: an older
+    /// version that its own device overwrote before anyone fetched it, made
+    /// into a copy by a device that only saw it in passing. Nothing can ever
+    /// fill such a copy, so it is deleted (everywhere, like any deletion)
+    /// instead of staying to do forever. Only conflict copies: a file the
+    /// user named waits for its content however long it takes.
+    pub fn give_up_on(&self, hash: &Hash) {
+        let mut state = lock(&self.state);
+        if state.disk.holding(hash, "").is_some() || self.download_paths(hash).1.exists() {
+            return;
+        }
+        let copies: Vec<(String, Version)> = state
+            .pending()
+            .iter()
+            .filter(|path| crate::folder::index::is_conflict(path))
+            .filter_map(|path| {
+                let entry = state.index.get(path)?;
+                (entry.file.as_ref()?.hash == *hash).then(|| (path.clone(), entry.version.clone()))
+            })
+            .collect();
+
+        for (path, version) in copies {
+            tracing::info!(
+                "{}: no device has the content of {path}; removing it",
+                self.id
+            );
+            let (_, changed) = state.index.edit(&path, &version, None);
+            state.pend(changed);
+        }
+        drop(state);
+        self.changed();
     }
 
     /// Drops downloaded content once no pending path wants it.

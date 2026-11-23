@@ -397,6 +397,52 @@ impl State {
         changed
     }
 
+    /// Settles paths that are live as a file and as a directory at once:
+    /// one device replaced a file with a directory while another edited the
+    /// file, say. No file system holds both, so the directory wins and the
+    /// file moves to a conflict copy beside it. Every device that sees the
+    /// clash records the same copy and a deletion, so the indexes converge
+    /// whichever does it first. Returns the paths that changed.
+    pub fn resolve_clashes(&mut self) -> Vec<String> {
+        let mut clashes = BTreeSet::new();
+
+        for path in &self.pending {
+            if !self.index.is_live(path) {
+                continue;
+            }
+            if self.index.live_under(path) {
+                clashes.insert(path.clone());
+            }
+            let mut at = 0;
+            while let Some(slash) = path[at..].find('/') {
+                let parent = &path[..at + slash];
+                if self.index.is_live(parent) {
+                    clashes.insert(parent.to_owned());
+                }
+                at += slash + 1;
+            }
+        }
+
+        let mut changed = Vec::new();
+        for path in clashes {
+            let Some(entry) = self.index.get(&path).cloned() else {
+                continue;
+            };
+            let Some(file) = entry.file else { continue };
+            let copy = Entry {
+                path: crate::folder::index::conflict_path(&path, &file.hash),
+                version: Version::default(),
+                file: Some(file),
+            };
+            changed.extend(self.index.merge(&copy));
+            let (_, deleted) = self.index.edit(&path, &entry.version, None);
+            changed.extend(deleted);
+        }
+
+        self.pend(changed.iter().cloned());
+        changed
+    }
+
     /// What `path` needs to match the index.
     pub fn work(&self, path: &str, rules: &Rules) -> Work {
         let entry = self.index.get(path);
@@ -627,6 +673,36 @@ mod tests {
     }
 
     #[test]
+    fn a_file_where_a_directory_lives_moves_aside() {
+        let mut state = State::new(1);
+        let meta = |byte: u8| FileMeta {
+            kind: Kind::File,
+            hash: Hash([byte; 32]),
+            size: 1,
+            mtime_ms: 0,
+            executable: false,
+        };
+        let file = Entry {
+            path: "x".into(),
+            version: Version::default().with(2, 1),
+            file: Some(meta(1)),
+        };
+        let inside = Entry {
+            path: "x/y".into(),
+            version: Version::default().with(3, 1),
+            file: Some(meta(2)),
+        };
+        state.merge(&[file, inside]);
+
+        let changed = state.resolve_clashes();
+        assert!(!changed.is_empty());
+        assert!(!state.index.is_live("x"));
+        assert!(state.index.is_live("x/y"));
+        assert!(state.index.is_live("x (conflict 01010101)"));
+        assert!(state.resolve_clashes().is_empty(), "settled once");
+    }
+
+    #[test]
     fn state_survives_a_round_trip() {
         let dir = tempfile::tempdir().expect("a temp dir");
         fs::write(dir.path().join("a"), "one").expect("write");
@@ -655,6 +731,7 @@ mod tests {
                 size: 1,
                 mtime_ns: 0,
                 inode: 0,
+                ctime_ns: 0,
                 executable: false,
             },
             version: Version::default(),

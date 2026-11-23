@@ -34,6 +34,8 @@ use tokio_util::task::AbortOnDropHandle;
 
 /// How often members exchange cluster state when nothing changed.
 const GOSSIP: Duration = Duration::from_secs(60);
+/// The first pause after a failed exchange, doubling up to `GOSSIP`.
+const GOSSIP_RETRY: Duration = Duration::from_secs(2);
 /// How often folders that failed to start are tried again.
 const FOLDER_CHECK: Duration = Duration::from_secs(30);
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -647,6 +649,7 @@ async fn gossip(service: Weak<Service>) {
         Some(service) => service.cluster_changes.subscribe(),
         None => return,
     };
+    let mut backoff = GOSSIP_RETRY;
 
     loop {
         let Some(service) = service.upgrade() else {
@@ -656,31 +659,41 @@ async fn gossip(service: Weak<Service>) {
         // round runs starts another.
         changes.borrow_and_update();
         let peers = lock(&service.cluster).others();
-        let exchanges = peers.into_iter().map(|peer| {
+        let mut exchanges = tokio::task::JoinSet::new();
+        for peer in peers {
             let service = service.clone();
-            async move {
+            exchanges.spawn(async move {
                 match timeout(EXCHANGE_TIMEOUT, service.exchange(peer)).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::debug!("cluster exchange with {}: {e:#}", short(&peer)),
-                    Err(_) => tracing::debug!("cluster exchange with {} timed out", short(&peer)),
+                    Ok(Ok(())) => true,
+                    Ok(Err(e)) => {
+                        tracing::debug!("cluster exchange with {}: {e:#}", short(&peer));
+                        false
+                    }
+                    Err(_) => {
+                        tracing::debug!("cluster exchange with {} timed out", short(&peer));
+                        false
+                    }
                 }
-            }
-        });
-        futures_join_all(exchanges).await;
+            });
+        }
         drop(service);
+        let mut failed = false;
+        while let Some(done) = exchanges.join_next().await {
+            failed |= !done.unwrap_or(false);
+        }
 
-        let _ = timeout(GOSSIP, changes.changed()).await;
+        // A failed exchange (with a device mid-join that does not know this
+        // one yet, say) is tried again soon, backing off to the usual pace.
+        let pause = if failed {
+            let pause = backoff;
+            backoff = (backoff * 2).min(GOSSIP);
+            pause
+        } else {
+            backoff = GOSSIP_RETRY;
+            GOSSIP
+        };
+        let _ = timeout(pause, changes.changed()).await;
     }
-}
-
-async fn futures_join_all<F: Future<Output = ()> + Send + 'static>(
-    futures: impl IntoIterator<Item = F>,
-) {
-    let mut set = tokio::task::JoinSet::new();
-    for future in futures {
-        set.spawn(future);
-    }
-    while set.join_next().await.is_some() {}
 }
 
 async fn manage_folders(service: Weak<Service>) {
@@ -725,12 +738,26 @@ impl ProtocolHandler for Members {
         }
 
         tracing::debug!("{} connected", short(&peer));
+        let mut changes = service.cluster_changes.subscribe();
         drop(service);
 
         loop {
-            let (send, recv) = match connection.accept_bi().await {
-                Ok(streams) => streams,
-                Err(_) => return Ok(()),
+            let (send, recv) = tokio::select! {
+                streams = connection.accept_bi() => match streams {
+                    Ok(streams) => streams,
+                    Err(_) => return Ok(()),
+                },
+                changed = changes.changed() => {
+                    // A device removed from the cluster loses everything it
+                    // has open here at once, pulls included.
+                    let removed = changed.is_err()
+                        || self.0.upgrade().is_none_or(|service| !lock(&service.cluster).is_member(&peer));
+                    if removed {
+                        connection.close(3u32.into(), b"removed");
+                        return Ok(());
+                    }
+                    continue;
+                }
             };
             let service = self.0.clone();
             tokio::spawn(async move {

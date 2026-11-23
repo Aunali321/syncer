@@ -94,7 +94,11 @@ pub fn build(service: &Service) -> Report {
             let held = peers.iter().filter(|peer| peer.waiting.is_some()).count();
             let state = if local.paused {
                 "paused".to_owned()
-            } else if let Some(why) = failed.get(id) {
+            } else if let Some(why) = failed.get(id).or_else(|| {
+                problems
+                    .as_ref()
+                    .and_then(|problems| problems.folder.as_ref())
+            }) {
                 format!("stopped: {why}")
             } else if cluster.folder(id).is_none() {
                 "removed from the cluster".to_owned()

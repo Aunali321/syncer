@@ -71,6 +71,16 @@ async fn once(node: &Node, folder: &Arc<Folder>, peer: DeviceId) -> Result<()> {
             changed = local_git.changed() => {
                 changed?;
                 local_git.borrow_and_update();
+                // The repository here moved away from the peer's (or went
+                // away entirely): settle the peer's state into it again.
+                if !folder.accepts(peer_head.as_ref())
+                    && let Some(state) = &peer_git
+                    && let Err(e) = folder
+                        .align_git(&peer, state, |wants, haves| fetch::pack(&connection, folder, wants, haves))
+                        .await
+                {
+                    tracing::debug!("{}: Git from {}: {e:#}", folder.id, short(&peer));
+                }
                 if held && folder.accepts(peer_head.as_ref()) {
                     return Ok(());
                 }

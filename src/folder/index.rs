@@ -371,6 +371,20 @@ impl Index {
         self.entries.get(path).map(|stored| &stored.entry)
     }
 
+    /// Whether `path` names a file or link that was not deleted.
+    pub fn is_live(&self, path: &str) -> bool {
+        self.get(path).is_some_and(|entry| entry.file.is_some())
+    }
+
+    /// Whether any path inside the directory `dir` is live.
+    pub fn live_under(&self, dir: &str) -> bool {
+        let prefix = format!("{dir}/");
+        self.entries
+            .range(prefix.clone()..)
+            .take_while(|(path, _)| path.starts_with(&prefix))
+            .any(|(_, stored)| stored.entry.file.is_some())
+    }
+
     pub fn entries(&self) -> impl Iterator<Item = &Entry> {
         self.entries.values().map(|stored| &stored.entry)
     }

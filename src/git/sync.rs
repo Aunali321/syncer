@@ -78,6 +78,15 @@ pub fn observe(repo: &Repo, memory: &mut Memory, me: [u8; 32]) -> Result<bool> {
 
     let branches = short(repo.refs(HEADS)?, HEADS);
     let head = repo.head()?;
+
+    if branches.is_empty() && !memory.known.is_empty() {
+        // Every branch gone at once is a repository deleted and made again
+        // (or replaced), not a user deleting branches: Git cannot delete the
+        // branch it has checked out. Spreading those deletes would delete
+        // every branch everywhere, so start over instead.
+        *memory = Memory::default();
+    }
+
     let mut changed = branches != memory.known;
 
     for (name, tip) in &memory.known {
@@ -228,7 +237,18 @@ pub fn align(
 
         match local {
             None => {
-                if let Some(deleted) = memory.tombstones.get(name)
+                // A branch the peer has checked out, with a HEAD newer than
+                // ours (so the checkout here follows it), is in use: that
+                // beats a delete here, as an edit beats a delete for files.
+                let checked_out_there = peer.head.as_ref().is_some_and(|theirs| {
+                    theirs.target == HeadTarget::Branch(name.clone())
+                        && memory
+                            .head
+                            .as_ref()
+                            .is_none_or(|ours| theirs.stamp > ours.stamp)
+                });
+                if !checked_out_there
+                    && let Some(deleted) = memory.tombstones.get(name)
                     && repo.has(deleted)?
                     && repo.contains(deleted, tip)?
                 {
@@ -259,41 +279,6 @@ pub fn align(
                     reference: conflict,
                     peer_tip: tip.clone(),
                 });
-            }
-        }
-    }
-
-    for (name, deleted) in &peer.tombstones {
-        if !valid_branch(name) || peer.branches.contains_key(name) || !repo.has(deleted)? {
-            continue;
-        }
-
-        match repo.resolve(&format!("{HEADS}{name}"))? {
-            Some(local) => {
-                if !repo.contains(deleted, &local)? {
-                    // Work the deleting device never saw: the branch stays.
-                    continue;
-                }
-                if checked_out.as_deref() == Some(name.as_str()) {
-                    aligned.notes.push(format!(
-                        "{name} was deleted elsewhere but is checked out here"
-                    ));
-                    continue;
-                }
-                repo.delete_ref(&format!("{HEADS}{name}"), &local)?;
-                memory.known.remove(name);
-                memory.tombstones.insert(name.clone(), deleted.clone());
-            }
-            None => {
-                let newer = match memory.tombstones.get(name) {
-                    Some(ours) => {
-                        repo.has(ours)? && repo.contains(deleted, ours)? && ours != deleted
-                    }
-                    None => true,
-                };
-                if newer {
-                    memory.tombstones.insert(name.clone(), deleted.clone());
-                }
             }
         }
     }
@@ -336,6 +321,64 @@ pub fn align(
         aligned.checkout_moved = true;
     }
 
+    // Deletes after HEAD has followed the peer, which may have moved off
+    // the deleted branch.
+    let checked_out_now = match repo.head()? {
+        HeadTarget::Branch(branch) => Some(branch),
+        HeadTarget::Detached(_) => None,
+    };
+    for (name, deleted) in &peer.tombstones {
+        if !valid_branch(name) || peer.branches.contains_key(name) || !repo.has(deleted)? {
+            continue;
+        }
+
+        match repo.resolve(&format!("{HEADS}{name}"))? {
+            Some(local) => {
+                if !repo.contains(deleted, &local)? {
+                    // Work the deleting device never saw: the branch stays.
+                    continue;
+                }
+                if checked_out_now.as_deref() == Some(name.as_str()) {
+                    aligned.notes.push(format!(
+                        "{name} was deleted elsewhere but is checked out here"
+                    ));
+                    continue;
+                }
+                repo.delete_ref(&format!("{HEADS}{name}"), &local)?;
+                memory.known.remove(name);
+                memory.tombstones.insert(name.clone(), deleted.clone());
+            }
+            None => {
+                let newer = match memory.tombstones.get(name) {
+                    Some(ours) => {
+                        repo.has(ours)? && repo.contains(deleted, ours)? && ours != deleted
+                    }
+                    None => true,
+                };
+                if newer {
+                    memory.tombstones.insert(name.clone(), deleted.clone());
+                }
+            }
+        }
+    }
+
+    // A conflict ref for this peer stands only while the peer's branch still
+    // diverges at that tip: once the peer moved on (merged, reset to ours,
+    // deleted the branch), it goes.
+    let prefix = format!("{CONFLICTS}{peer_label}/");
+    for (reference, held) in repo.refs(&prefix)? {
+        let Some(branch) = reference.strip_prefix(&prefix) else {
+            continue;
+        };
+        let current = aligned
+            .diverged
+            .iter()
+            .any(|diverged| diverged.branch == branch && diverged.peer_tip == held);
+        if !current {
+            repo.delete_ref(&reference, &held)?;
+        }
+    }
+
     clear_resolved(repo)?;
     Ok(aligned)
 }
@@ -346,8 +389,13 @@ fn head_ready(repo: &Repo, target: &HeadTarget) -> Result<Result<(), String>> {
         HeadTarget::Branch(branch) if !valid_branch(branch) => {
             Err(format!("ignoring the branch name {branch:?}"))
         }
-        // An unborn branch is fine: a new repository's HEAD names one.
-        HeadTarget::Branch(_) => Ok(()),
+        HeadTarget::Branch(branch) if repo.resolve(&format!("{HEADS}{branch}"))?.is_some() => {
+            Ok(())
+        }
+        // An unborn branch only in a repository with no commits yet, as a
+        // new one is: anywhere else it would leave the checkout empty.
+        HeadTarget::Branch(_) if repo.refs(HEADS)?.is_empty() => Ok(()),
+        HeadTarget::Branch(branch) => Err(format!("waiting for the branch {branch} to arrive")),
         HeadTarget::Detached(oid) if repo.complete(oid)? => Ok(()),
         HeadTarget::Detached(oid) => Err(format!("the detached HEAD {oid:?} has not arrived")),
     })
@@ -635,6 +683,64 @@ mod tests {
         observe(&a, &mut am, A).expect("observed");
         align(&a, &mut am, &b_state, "b").expect("aligned");
         assert_eq!(a.head().expect("HEAD"), HeadTarget::Branch("main".into()));
+    }
+
+    #[test]
+    fn a_repository_made_again_deletes_nothing_elsewhere() {
+        let (_a_dir, a, b_dir, b) = pair();
+        git(&a, &["branch", "topic"]);
+        let (mut am, mut bm) = (Memory::default(), Memory::default());
+        sync(&a, &mut am, &b, &mut bm);
+        assert!(bm.known.contains_key("topic"));
+
+        // b's .git is deleted and an empty repository takes its place.
+        std::fs::remove_dir_all(b.root().join(".git")).expect("rm");
+        let state = advertise(&a, &am).expect("state");
+        let b = bootstrap(b_dir.path(), &state).expect("bootstrapped");
+        let aligned = sync(&a, &mut am, &b, &mut bm);
+
+        assert!(bm.tombstones.is_empty(), "{:?}", bm.tombstones);
+        assert_eq!(b.refs(HEADS).expect("refs"), a.refs(HEADS).expect("refs"));
+        assert!(aligned.diverged.is_empty());
+    }
+
+    #[test]
+    fn a_branch_checked_out_elsewhere_beats_its_delete() {
+        let (_a_dir, a, _b_dir, b) = pair();
+        git(&a, &["branch", "topic"]);
+        let (mut am, mut bm) = (Memory::default(), Memory::default());
+        sync(&a, &mut am, &b, &mut bm);
+
+        // b deletes topic while a checks it out.
+        git(&b, &["branch", "-q", "-D", "topic"]);
+        observe(&b, &mut bm, B).expect("observed");
+        git(&a, &["checkout", "-q", "topic"]);
+        sync(&a, &mut am, &b, &mut bm);
+
+        assert!(
+            b.refs(HEADS)
+                .expect("refs")
+                .contains_key("refs/heads/topic")
+        );
+        assert_eq!(b.head().expect("HEAD"), HeadTarget::Branch("topic".into()));
+        assert!(
+            b.head_commit().expect("HEAD").is_some(),
+            "not an empty checkout"
+        );
+        assert!(!bm.tombstones.contains_key("topic"));
+    }
+
+    #[test]
+    fn head_never_moves_to_a_branch_that_is_not_here() {
+        let (_a_dir, a, _b_dir, b) = pair();
+        let (mut am, mut bm) = (Memory::default(), Memory::default());
+        sync(&a, &mut am, &b, &mut bm);
+
+        // a checks out a branch with no commits yet.
+        git(&a, &["checkout", "-q", "--orphan", "fresh"]);
+        let aligned = sync(&a, &mut am, &b, &mut bm);
+        assert_eq!(b.head().expect("HEAD"), HeadTarget::Branch("main".into()));
+        assert!(aligned.notes.iter().any(|note| note.contains("fresh")));
     }
 
     #[test]

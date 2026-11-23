@@ -21,6 +21,10 @@ pub struct Stat {
     pub mtime_ns: i128,
     /// 0 where the platform has none.
     pub inode: u64,
+    /// When the inode last changed, which any write moves even when the
+    /// writer puts the mtime back. 0 where the platform has none.
+    #[serde(default)]
+    pub ctime_ns: i128,
     pub executable: bool,
 }
 
@@ -41,6 +45,7 @@ impl Stat {
             size: meta.len(),
             mtime_ns: meta.modified().map(nanos).unwrap_or(0),
             inode: inode(meta),
+            ctime_ns: ctime(meta),
             executable: kind == Kind::File && executable(meta),
         })
     }
@@ -64,6 +69,17 @@ fn inode(meta: &Metadata) -> u64 {
 
 #[cfg(not(unix))]
 fn inode(_: &Metadata) -> u64 {
+    0
+}
+
+#[cfg(unix)]
+fn ctime(meta: &Metadata) -> i128 {
+    use std::os::unix::fs::MetadataExt;
+    i128::from(meta.ctime()) * 1_000_000_000 + i128::from(meta.ctime_nsec())
+}
+
+#[cfg(not(unix))]
+fn ctime(_: &Metadata) -> i128 {
     0
 }
 
@@ -203,6 +219,14 @@ pub fn place(
         bail!("{path} changed on disk; it is scanned again first");
     }
 
+    // An empty directory in the way (left by a file that became a directory
+    // and was emptied again; empty directories do not sync) gives way. One
+    // with anything in it does not: removing it fails.
+    if expected.is_none() && fs::symlink_metadata(&target).is_ok_and(|meta| meta.is_dir()) {
+        remove_empty_tree(&target)
+            .with_context(|| format!("{} is a directory with files in it", target.display()))?;
+    }
+
     if let Some(Stat {
         kind: Kind::File, ..
     }) = expected
@@ -215,6 +239,21 @@ pub fn place(
     fs::rename(temp, &target).with_context(|| format!("moving into {}", target.display()))?;
     sync_dir(target.parent());
     stat(&target)?.with_context(|| format!("{} vanished after it was placed", target.display()))
+}
+
+/// Removes `dir` if nothing but empty directories is under it; fails, having
+/// removed nothing that held a file, otherwise.
+fn remove_empty_tree(dir: &Path) -> Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            remove_empty_tree(&entry.path())?;
+        } else {
+            bail!("{} is in the way", entry.path().display());
+        }
+    }
+    fs::remove_dir(dir)?;
+    Ok(())
 }
 
 /// Removes the file at `path` when it still holds what `expected` says, then
@@ -395,6 +434,29 @@ mod tests {
         remove(root, "a/b/c.txt", &placed).expect("removed");
         assert!(!root.join("a").exists());
         assert!(root.exists());
+    }
+
+    #[test]
+    fn an_empty_directory_gives_way_to_a_file_and_a_full_one_does_not() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = dir.path();
+        let meta = FileMeta {
+            kind: Kind::File,
+            hash: Hash::of(b"x"),
+            size: 1,
+            mtime_ms: 0,
+            executable: false,
+        };
+        fs::create_dir_all(root.join("empty/nested/deeper")).expect("mkdir");
+        fs::create_dir_all(root.join("full/inner")).expect("mkdir");
+        fs::write(root.join("full/inner/file"), "keep").expect("write");
+        for name in ["empty", "full"] {
+            fs::write(root.join("temp"), "x").expect("write");
+            let placed = place(root, name, &root.join("temp"), &meta, None);
+            assert_eq!(placed.is_ok(), name == "empty", "{name}");
+        }
+        assert!(root.join("empty").is_file());
+        assert!(root.join("full/inner").is_dir());
     }
 
     #[test]

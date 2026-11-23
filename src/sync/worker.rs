@@ -35,6 +35,9 @@ const RETRY: Duration = Duration::from_secs(30);
 const SAVE: Duration = Duration::from_secs(5);
 /// Downloads in flight at once.
 const PARALLEL_FETCHES: usize = 8;
+/// How long content must stay missing from every device before conflict
+/// copies of it are given up on.
+const GIVE_UP: Duration = Duration::from_secs(30);
 /// How long an apply round waits for more downloads to finish, so a burst
 /// of small files is placed in a few rounds rather than one each.
 const GATHER: Duration = Duration::from_millis(250);
@@ -87,7 +90,9 @@ pub async fn run(node: Arc<Node>, folder: Arc<Folder>, mut peers: watch::Receive
     let mut save = interval(SAVE);
     let mut due = Due::default();
     let mut pullers: HashMap<DeviceId, AbortOnDropHandle<()>> = HashMap::new();
-    let mut fetches: JoinSet<(Hash, anyhow::Result<()>)> = JoinSet::new();
+    let mut fetches: JoinSet<(Hash, anyhow::Result<fetch::Fetched>)> = JoinSet::new();
+    // Content every peer said it does not have, and since when.
+    let mut nowhere: HashMap<Hash, Instant> = HashMap::new();
     let mut in_flight: HashSet<Hash> = HashSet::new();
     let mut queued: Vec<(Hash, String)> = Vec::new();
     // When the next apply round runs; rounds gather what arrives meanwhile.
@@ -126,8 +131,27 @@ pub async fn run(node: Arc<Node>, folder: Arc<Folder>, mut peers: watch::Receive
                 if let Ok((hash, result)) = joined {
                     in_flight.remove(&hash);
                     match result {
-                        Ok(()) => folder.work.notify_one(),
-                        Err(e) => tracing::debug!("{}: fetching {}: {e:#}", folder.id, hash.short()),
+                        Ok(fetch::Fetched::Done) => {
+                            nowhere.remove(&hash);
+                            folder.work.notify_one();
+                        }
+                        // Asked twice, a while apart, of every device that
+                        // holds the folder: it exists nowhere.
+                        Ok(fetch::Fetched::Nowhere) => match nowhere.get(&hash) {
+                            Some(since) if since.elapsed() >= GIVE_UP => {
+                                nowhere.remove(&hash);
+                                folder.give_up_on(&hash);
+                                folder.work.notify_one();
+                            }
+                            Some(_) => {}
+                            None => {
+                                nowhere.insert(hash, Instant::now());
+                            }
+                        },
+                        Err(e) => {
+                            nowhere.remove(&hash);
+                            tracing::debug!("{}: fetching {}: {e:#}", folder.id, hash.short());
+                        }
                     }
                 }
             }

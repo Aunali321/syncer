@@ -20,14 +20,26 @@ use tokio::{
 
 /// Fetches content `hash` (wanted at `path`) from the first of `peers` that
 /// has it, into the folder's downloads.
+/// What fetching content came to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Fetched {
+    /// The content is in the folder's downloads.
+    Done,
+    /// Every peer was reached and none has it.
+    Nowhere,
+}
+
+/// Fetches content `hash` (wanted at `path`) from the first of `peers` that
+/// has it, into the folder's downloads. Fails when a peer could not be
+/// asked, so `Nowhere` means every peer said it does not have it.
 pub async fn content(
     node: &Node,
     folder: &Arc<Folder>,
     peers: &[DeviceId],
     hash: Hash,
     path: &str,
-) -> Result<()> {
-    let mut last = None;
+) -> Result<Fetched> {
+    let mut failed = None;
 
     for peer in peers {
         let attempt = async {
@@ -35,19 +47,28 @@ pub async fn content(
             content_from(&connection, folder, hash, path).await
         };
         match attempt.await {
-            Ok(()) => return Ok(()),
+            Ok(true) => return Ok(Fetched::Done),
+            Ok(false) => tracing::debug!(
+                "{}: {path}: {} does not have it",
+                folder.id,
+                crate::ids::short(peer)
+            ),
             Err(e) => {
                 tracing::debug!(
                     "{}: {path} from {}: {e:#}",
                     folder.id,
                     crate::ids::short(peer)
                 );
-                last = Some(e);
+                failed = Some(e);
             }
         }
     }
 
-    Err(last.unwrap_or_else(|| anyhow::anyhow!("no peer that holds this folder is reachable")))
+    match failed {
+        Some(e) => Err(e),
+        None if peers.is_empty() => Err(anyhow::anyhow!("no peer holds this folder")),
+        None => Ok(Fetched::Nowhere),
+    }
 }
 
 async fn content_from(
@@ -55,7 +76,7 @@ async fn content_from(
     folder: &Arc<Folder>,
     hash: Hash,
     path: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let (part, done) = folder.download_paths(&hash);
     let offset = tokio::fs::metadata(&part)
         .await
@@ -76,7 +97,7 @@ async fn content_from(
 
     let size = match wire::expect::<GetReply>(&mut recv).await? {
         GetReply::Found { size } => size,
-        GetReply::Missing => bail!("the peer no longer has this content"),
+        GetReply::Missing => return Ok(false),
     };
 
     // The part already here counts towards the hash.
@@ -119,7 +140,7 @@ async fn content_from(
     }
 
     tokio::fs::rename(&part, &done).await?;
-    Ok(())
+    Ok(true)
 }
 
 fn hash_prefix(part: &Path) -> Result<blake3::Hasher> {
