@@ -1,0 +1,13 @@
+[Unit]
+Description=syncer: peer-to-peer folder sync
+Documentation=https://github.com/aunali321/syncer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.cargo/bin/syncer run
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
