@@ -402,16 +402,19 @@ fn a_storm_of_commits_branches_and_switches_settles() {
             let back = a
                 .try_git(&["symbolic-ref", "--short", "HEAD"])
                 .unwrap_or_default();
-            let _ = a.try_git(&["stash", "-q", "--include-untracked"]);
+            // Work in progress is committed, not stashed: a stash that does
+            // not apply back leaves the index unmerged and wedges the test.
+            let _ = a.try_git(&["add", "-A"]);
+            let _ = a.try_git(&["commit", "-q", "-m", "save work"]);
             if a.try_git(&["checkout", "-q", &branch]).is_ok() {
                 if a.try_git(&["merge", "-q", "--no-edit", "-X", "ours", &reference])
                     .is_err()
                 {
                     let _ = a.try_git(&["merge", "--abort"]);
+                    let _ = a.try_git(&["merge", "-q", "--no-edit", "-s", "ours", &reference]);
                 }
                 let _ = a.try_git(&["checkout", "-q", back.trim()]);
             }
-            let _ = a.try_git(&["stash", "pop", "-q"]);
         }
         let quiet = devices
             .iter()
