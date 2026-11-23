@@ -28,7 +28,10 @@ impl TryFrom<String> for Oid {
 
     fn try_from(text: String) -> Result<Self> {
         ensure!(
-            matches!(text.len(), 40 | 64) && text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            matches!(text.len(), 40 | 64)
+                && text
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
             "not a Git object id: {text:?}"
         );
         Ok(Self(text))
@@ -91,12 +94,16 @@ impl Repo {
     /// The repository whose work tree is `root`, when `root/.git` is one.
     /// Linked worktrees and submodules (a `.git` file) are not synced.
     pub fn open(root: &Path) -> Option<Self> {
-        root.join(".git").is_dir().then(|| Self { root: root.to_owned() })
+        root.join(".git").is_dir().then(|| Self {
+            root: root.to_owned(),
+        })
     }
 
     /// Makes a new repository at `root` whose HEAD names `branch`.
     pub fn init(root: &Path, branch: &str) -> Result<Self> {
-        let repo = Self { root: root.to_owned() };
+        let repo = Self {
+            root: root.to_owned(),
+        };
         repo.run(["init", "--quiet"])?;
         repo.run(["symbolic-ref", "HEAD", &format!("{HEADS}{branch}")])?;
         Ok(repo)
@@ -140,7 +147,10 @@ impl Repo {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let args: Vec<_> = args.into_iter().map(|arg| arg.as_ref().to_owned()).collect();
+        let args: Vec<_> = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_owned())
+            .collect();
         self.command()
             .args(&args)
             .output()
@@ -154,7 +164,10 @@ impl Repo {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let args: Vec<_> = args.into_iter().map(|arg| arg.as_ref().to_owned()).collect();
+        let args: Vec<_> = args
+            .into_iter()
+            .map(|arg| arg.as_ref().to_owned())
+            .collect();
         let output = self.output(&args)?;
 
         if !output.status.success() {
@@ -186,7 +199,9 @@ impl Repo {
             return Ok(HeadTarget::Branch(short.to_owned()));
         }
 
-        Ok(HeadTarget::Detached(self.resolve("HEAD")?.context("HEAD names no commit")?))
+        Ok(HeadTarget::Detached(
+            self.resolve("HEAD")?.context("HEAD names no commit")?,
+        ))
     }
 
     /// The commit HEAD is at; `None` on an unborn branch.
@@ -202,7 +217,9 @@ impl Repo {
             return Ok(None);
         }
 
-        Ok(Some(Oid::try_from(String::from_utf8(output.stdout)?.trim().to_owned())?))
+        Ok(Some(Oid::try_from(
+            String::from_utf8(output.stdout)?.trim().to_owned(),
+        )?))
     }
 
     /// Every ref under `prefix`, by full name.
@@ -220,7 +237,10 @@ impl Repo {
 
     /// Whether the object `oid` is in the repository.
     pub fn has(&self, oid: &Oid) -> Result<bool> {
-        Ok(self.output(["cat-file", "-e", oid.as_str()])?.status.success())
+        Ok(self
+            .output(["cat-file", "-e", oid.as_str()])?
+            .status
+            .success())
     }
 
     /// Whether `ancestor` is `descendant` or in its history. Both must be here.
@@ -229,7 +249,12 @@ impl Repo {
             return Ok(true);
         }
 
-        let output = self.output(["merge-base", "--is-ancestor", ancestor.as_str(), descendant.as_str()])?;
+        let output = self.output([
+            "merge-base",
+            "--is-ancestor",
+            ancestor.as_str(),
+            descendant.as_str(),
+        ])?;
 
         match output.status.code() {
             Some(0) => Ok(true),
@@ -249,7 +274,14 @@ impl Repo {
         }
 
         Ok(self
-            .output(["rev-list", "--objects", "--quiet", tip.as_str(), "--not", "--all"])?
+            .output([
+                "rev-list",
+                "--objects",
+                "--quiet",
+                tip.as_str(),
+                "--not",
+                "--all",
+            ])?
             .status
             .success())
     }
@@ -274,10 +306,23 @@ impl Repo {
     pub fn set_head(&self, target: &HeadTarget) -> Result<()> {
         match target {
             HeadTarget::Branch(branch) => {
-                self.run(["symbolic-ref", "-m", "syncer", "HEAD", &format!("{HEADS}{branch}")])?;
+                self.run([
+                    "symbolic-ref",
+                    "-m",
+                    "syncer",
+                    "HEAD",
+                    &format!("{HEADS}{branch}"),
+                ])?;
             }
             HeadTarget::Detached(oid) => {
-                self.run(["update-ref", "--no-deref", "-m", "syncer", "HEAD", oid.as_str()])?;
+                self.run([
+                    "update-ref",
+                    "--no-deref",
+                    "-m",
+                    "syncer",
+                    "HEAD",
+                    oid.as_str(),
+                ])?;
             }
         }
 
@@ -319,7 +364,14 @@ impl Repo {
 
         let mut command = self.command();
         command
-            .args(["pack-objects", "--revs", "--thin", "--stdout", "--delta-base-offset", "-q"])
+            .args([
+                "pack-objects",
+                "--revs",
+                "--thin",
+                "--stdout",
+                "--delta-base-offset",
+                "-q",
+            ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -343,7 +395,10 @@ impl Repo {
     pub fn pack(&self, wants: &[Oid], haves: &[Oid]) -> Result<Child> {
         let (mut command, input) = self.pack_command(wants, haves)?;
         let mut child = command.spawn().context("running git pack-objects")?;
-        let mut stdin = child.stdin.take().context("git pack-objects has no input")?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("git pack-objects has no input")?;
         std::thread::spawn(move || {
             let _ = stdin.write_all(&input);
         });
@@ -351,7 +406,9 @@ impl Repo {
     }
 
     pub fn unpack(&self) -> Result<Child> {
-        self.unpack_command().spawn().context("running git index-pack")
+        self.unpack_command()
+            .spawn()
+            .context("running git index-pack")
     }
 
     /// The repository's config as `key=value` pairs, multi-valued keys
@@ -383,7 +440,10 @@ impl Repo {
         }
 
         std::fs::create_dir_all(path.parent().context("a path with no parent")?)?;
-        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
         if !current.is_empty() && !current.ends_with('\n') {
             file.write_all(b"\n")?;
         }
@@ -394,7 +454,9 @@ impl Repo {
 
 /// Waits for a git child and fails with its message when it failed.
 pub fn finish(child: Child, what: &str) -> Result<()> {
-    let output = child.wait_with_output().with_context(|| format!("waiting for git {what}"))?;
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("waiting for git {what}"))?;
 
     if !output.status.success() {
         bail!(
@@ -434,7 +496,11 @@ pub(crate) mod testing {
     pub fn repo() -> (tempfile::TempDir, Repo) {
         let dir = tempfile::tempdir().expect("a temp dir");
         let repo = Repo::init(dir.path(), "main").expect("git init");
-        for (key, value) in [("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false")] {
+        for (key, value) in [
+            ("user.name", "Test"),
+            ("user.email", "test@example.com"),
+            ("commit.gpgsign", "false"),
+        ] {
             repo.run(["config", key, value]).expect("git config");
         }
         commit(&repo, "first");
@@ -445,7 +511,8 @@ pub(crate) mod testing {
     pub fn commit(repo: &Repo, text: &str) -> Oid {
         std::fs::write(repo.root().join("file.txt"), text).expect("write");
         repo.run(["add", "file.txt"]).expect("git add");
-        repo.run(["commit", "--quiet", "-m", text]).expect("git commit");
+        repo.run(["commit", "--quiet", "-m", text])
+            .expect("git commit");
         repo.head_commit().expect("HEAD").expect("a commit")
     }
 
@@ -465,7 +532,10 @@ mod tests {
         let first = repo.head_commit().expect("HEAD").expect("a commit");
         let second = commit(&repo, "second");
 
-        assert_eq!(repo.head().expect("HEAD"), HeadTarget::Branch("main".into()));
+        assert_eq!(
+            repo.head().expect("HEAD"),
+            HeadTarget::Branch("main".into())
+        );
         assert_eq!(repo.refs(HEADS).expect("refs")["refs/heads/main"], second);
         assert!(repo.contains(&second, &first).expect("ancestry"));
         assert!(!repo.contains(&first, &second).expect("ancestry"));
@@ -479,12 +549,23 @@ mod tests {
         let first = repo.head_commit().expect("HEAD").expect("a commit");
         let second = commit(&repo, "second");
 
-        assert!(repo.update_ref("refs/heads/main", &first, Some(&first)).is_err());
-        repo.update_ref("refs/heads/topic", &first, None).expect("created");
+        assert!(
+            repo.update_ref("refs/heads/main", &first, Some(&first))
+                .is_err()
+        );
+        repo.update_ref("refs/heads/topic", &first, None)
+            .expect("created");
         assert!(repo.update_ref("refs/heads/topic", &second, None).is_err());
-        repo.update_ref("refs/heads/topic", &second, Some(&first)).expect("moved");
-        repo.delete_ref("refs/heads/topic", &second).expect("deleted");
-        assert!(!repo.refs(HEADS).expect("refs").contains_key("refs/heads/topic"));
+        repo.update_ref("refs/heads/topic", &second, Some(&first))
+            .expect("moved");
+        repo.delete_ref("refs/heads/topic", &second)
+            .expect("deleted");
+        assert!(
+            !repo
+                .refs(HEADS)
+                .expect("refs")
+                .contains_key("refs/heads/topic")
+        );
     }
 
     #[test]
@@ -494,10 +575,14 @@ mod tests {
         commit(&repo, "second");
         git(&repo, &["branch", "old", first.as_str()]);
 
-        repo.set_head(&HeadTarget::Branch("old".into())).expect("moved");
+        repo.set_head(&HeadTarget::Branch("old".into()))
+            .expect("moved");
 
         assert_eq!(repo.head().expect("HEAD"), HeadTarget::Branch("old".into()));
-        assert_eq!(std::fs::read_to_string(repo.root().join("file.txt")).expect("read"), "second");
+        assert_eq!(
+            std::fs::read_to_string(repo.root().join("file.txt")).expect("read"),
+            "second"
+        );
         // The index is the old commit's, so the file reads as modified.
         assert_eq!(git(&repo, &["status", "--porcelain"]).trim(), "M file.txt");
     }
@@ -520,7 +605,9 @@ mod tests {
 
         // A thin pack on top of what b has.
         let tip = commit(&a, "more");
-        let mut pack = a.pack(std::slice::from_ref(&tip), std::slice::from_ref(&base)).expect("pack");
+        let mut pack = a
+            .pack(std::slice::from_ref(&tip), std::slice::from_ref(&base))
+            .expect("pack");
         let mut unpack = b.unpack().expect("unpack");
         let mut out = pack.stdout.take().expect("stdout");
         let mut input = unpack.stdin.take().expect("stdin");

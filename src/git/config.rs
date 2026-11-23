@@ -39,7 +39,10 @@ fn safe_url(url: &str) -> bool {
     }
 
     match lower.split_once("://") {
-        Some((scheme, _)) => matches!(scheme, "https" | "http" | "ssh" | "git" | "git+ssh" | "ssh+git" | "file"),
+        Some((scheme, _)) => matches!(
+            scheme,
+            "https" | "http" | "ssh" | "git" | "git+ssh" | "ssh+git" | "file"
+        ),
         // scp-like `user@host:path`, or a local path.
         None => true,
     }
@@ -51,9 +54,18 @@ mod tests {
 
     #[test]
     fn remotes_and_tracking_travel() {
-        assert!(allowed("remote.origin.url", "git@github.com:me/project.git"));
-        assert!(allowed("remote.origin.url", "https://github.com/me/project"));
-        assert!(allowed("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"));
+        assert!(allowed(
+            "remote.origin.url",
+            "git@github.com:me/project.git"
+        ));
+        assert!(allowed(
+            "remote.origin.url",
+            "https://github.com/me/project"
+        ));
+        assert!(allowed(
+            "remote.origin.fetch",
+            "+refs/heads/*:refs/remotes/origin/*"
+        ));
         assert!(allowed("branch.main.remote", "origin"));
         assert!(allowed("branch.main.merge", "refs/heads/main"));
         assert!(allowed("user.email", "me@example.com"));

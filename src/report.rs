@@ -35,8 +35,17 @@ pub struct FolderReport {
     pub state: String,
     pub summary: Option<Summary>,
     pub problems: Option<Problems>,
-    /// The other devices holding it, by name, with why their changes wait.
-    pub peers: Vec<(String, Option<String>)>,
+    /// The other devices holding it.
+    pub peers: Vec<PeerReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerReport {
+    pub name: String,
+    /// Why its changes are held back, if they are.
+    pub waiting: Option<String>,
+    /// Git notes about it: diverged branches and the like.
+    pub git: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,10 +71,27 @@ pub fn build(service: &Service) -> Report {
         .folders
         .iter()
         .map(|(id, local)| {
-            let label = cluster.folder(id).map_or_else(|| id.to_string(), |folder| folder.label.clone());
+            let label = cluster
+                .folder(id)
+                .map_or_else(|| id.to_string(), |folder| folder.label.clone());
             let running = service.folder(id);
             let problems = running.as_ref().map(|folder| folder.problems());
             let summary = running.as_ref().map(|folder| folder.summary());
+            let peers: Vec<PeerReport> = cluster
+                .holders(id)
+                .iter()
+                .map(|peer| PeerReport {
+                    name: cluster.name_of(peer),
+                    waiting: problems
+                        .as_ref()
+                        .and_then(|problems| problems.waiting.get(peer).cloned()),
+                    git: problems
+                        .as_ref()
+                        .and_then(|problems| problems.git.get(peer).cloned())
+                        .unwrap_or_default(),
+                })
+                .collect();
+            let held = peers.iter().filter(|peer| peer.waiting.is_some()).count();
             let state = if local.paused {
                 "paused".to_owned()
             } else if let Some(why) = failed.get(id) {
@@ -73,18 +99,16 @@ pub fn build(service: &Service) -> Report {
             } else if cluster.folder(id).is_none() {
                 "removed from the cluster".to_owned()
             } else if let Some(summary) = &summary {
-                if summary.pending > 0 { format!("syncing, {} to do", summary.pending) } else { "up to date".to_owned() }
+                match (summary.pending, held) {
+                    (0, 0) => "up to date".to_owned(),
+                    (0, held) => {
+                        format!("up to date here; changes from {held} device(s) held back")
+                    }
+                    (pending, _) => format!("syncing, {pending} to do"),
+                }
             } else {
                 "starting".to_owned()
             };
-            let peers = cluster
-                .holders(id)
-                .iter()
-                .map(|peer| {
-                    let waiting = problems.as_ref().and_then(|problems| problems.waiting.get(peer).cloned());
-                    (cluster.name_of(peer), waiting)
-                })
-                .collect();
 
             FolderReport {
                 id: id.to_string(),
@@ -104,7 +128,11 @@ pub fn build(service: &Service) -> Report {
         .map(|(id, folder)| Offer {
             id: id.to_string(),
             label: folder.label.clone(),
-            from: cluster.holders(id).iter().map(|peer| cluster.name_of(peer)).collect(),
+            from: cluster
+                .holders(id)
+                .iter()
+                .map(|peer| cluster.name_of(peer))
+                .collect(),
         })
         .filter(|offer| !offer.from.is_empty())
         .collect();
@@ -122,11 +150,18 @@ impl fmt::Display for Report {
         writeln!(f, "This device: {} ({})", self.me.name, self.me.short)?;
 
         if self.devices.is_empty() {
-            writeln!(f, "No other devices yet. Run `syncer invite` here and `syncer join` on another.")?;
+            writeln!(
+                f,
+                "No other devices yet. Run `syncer invite` here and `syncer join` on another."
+            )?;
         } else {
             writeln!(f, "\nDevices")?;
             for device in &self.devices {
-                let state = if device.connected { "connected" } else { "not connected" };
+                let state = if device.connected {
+                    "connected"
+                } else {
+                    "not connected"
+                };
                 writeln!(f, "  {} ({}): {state}", device.name, device.short)?;
             }
         }
@@ -139,7 +174,9 @@ impl fmt::Display for Report {
                 let mut line = format!("  {} files, {}", summary.files, bytes(summary.bytes));
                 match &summary.head {
                     Some(HeadTarget::Branch(branch)) => write!(line, "; on branch {branch}").ok(),
-                    Some(HeadTarget::Detached(oid)) => write!(line, "; detached at {}", &oid.as_str()[..12]).ok(),
+                    Some(HeadTarget::Detached(oid)) => {
+                        write!(line, "; detached at {}", &oid.as_str()[..12]).ok()
+                    }
                     None => None,
                 };
                 writeln!(f, "{line}")?;
@@ -151,30 +188,43 @@ impl fmt::Display for Report {
                 }
             }
 
-            for (peer, waiting) in &folder.peers {
-                match waiting {
-                    Some(why) => writeln!(f, "  with {peer}: waiting, {why}")?,
-                    None => writeln!(f, "  with {peer}")?,
+            for peer in &folder.peers {
+                match &peer.waiting {
+                    Some(why) => writeln!(f, "  with {}: waiting, {why}", peer.name)?,
+                    None => writeln!(f, "  with {}", peer.name)?,
+                }
+                for note in &peer.git {
+                    writeln!(f, "    Git: {note}")?;
                 }
             }
 
             if let Some(problems) = &folder.problems {
-                for note in &problems.git {
-                    writeln!(f, "  Git: {note}")?;
-                }
                 for (path, why) in problems.files.iter().take(10) {
                     writeln!(f, "  {path}: {why}")?;
                 }
                 if problems.files.len() > 10 {
-                    writeln!(f, "  and {} more paths that could not be synced", problems.files.len() - 10)?;
+                    writeln!(
+                        f,
+                        "  and {} more paths that could not be synced",
+                        problems.files.len() - 10
+                    )?;
                 }
             }
         }
 
         if !self.offers.is_empty() {
-            writeln!(f, "\nOffered to this device (take one with `syncer accept <id> <path>`):")?;
+            writeln!(
+                f,
+                "\nOffered to this device (take one with `syncer accept <id> <path>`):"
+            )?;
             for offer in &self.offers {
-                writeln!(f, "  {} [{}] from {}", offer.label, offer.id, offer.from.join(", "))?;
+                writeln!(
+                    f,
+                    "  {} [{}] from {}",
+                    offer.label,
+                    offer.id,
+                    offer.from.join(", ")
+                )?;
             }
         }
 

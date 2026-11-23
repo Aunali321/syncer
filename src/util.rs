@@ -20,7 +20,8 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut temp = OsString::from(path);
     temp.push(".tmp");
     let temp = PathBuf::from(temp);
-    let mut file = fs::File::create(&temp).with_context(|| format!("writing {}", temp.display()))?;
+    let mut file =
+        fs::File::create(&temp).with_context(|| format!("writing {}", temp.display()))?;
     file.write_all(bytes)?;
     file.sync_all()?;
     fs::rename(&temp, path).with_context(|| format!("writing {}", path.display()))

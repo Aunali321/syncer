@@ -14,7 +14,7 @@ use iroh::{
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Mutex,
     time::Duration,
 };
@@ -31,7 +31,8 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// How the endpoint finds and reaches peers.
 #[derive(Debug, Clone)]
 pub struct NetOptions {
-    /// UDP port to bind; 0 picks one.
+    /// UDP port to bind; 0 reuses the port of the last run, so peers that
+    /// remember this device's address still reach it, or picks one.
     pub port: u16,
     /// Public relays and DNS address lookup (iroh's n0 services). Off, only
     /// direct addresses and the local network work.
@@ -50,7 +51,41 @@ impl Default for NetOptions {
     }
 }
 
-pub async fn bind(secret: SecretKey, options: &NetOptions) -> Result<Endpoint> {
+/// Binds the endpoint. With no port asked for, the port of the last run
+/// (kept in `port_file`) is tried first, then any.
+pub async fn bind(secret: SecretKey, options: &NetOptions, port_file: &Path) -> Result<Endpoint> {
+    let remembered = std::fs::read_to_string(port_file)
+        .ok()
+        .and_then(|text| text.trim().parse::<u16>().ok());
+    let port = if options.port != 0 {
+        Some(options.port)
+    } else {
+        remembered
+    };
+
+    let endpoint = match port {
+        Some(port) => match bind_on(secret.clone(), options, port).await {
+            Ok(endpoint) => endpoint,
+            Err(e) if options.port == 0 => {
+                tracing::warn!("UDP port {port} is taken, using another: {e:#}");
+                bind_on(secret, options, 0).await?
+            }
+            Err(e) => return Err(e),
+        },
+        None => bind_on(secret, options, 0).await?,
+    };
+
+    if let Some(bound) = endpoint.bound_sockets().first().map(|addr| addr.port())
+        && remembered != Some(bound)
+        && let Err(e) = write_atomic(port_file, bound.to_string().as_bytes())
+    {
+        tracing::warn!("remembering the UDP port: {e:#}");
+    }
+
+    Ok(endpoint)
+}
+
+async fn bind_on(secret: SecretKey, options: &NetOptions, port: u16) -> Result<Endpoint> {
     // Every datagram on its own: some network cards silently drop batched
     // ones, which stalls large transfers on connections that look healthy.
     let transport = QuicTransportConfig::builder()
@@ -72,12 +107,12 @@ pub async fn bind(secret: SecretKey, options: &NetOptions) -> Result<Endpoint> {
         );
     }
 
-    if options.port != 0 {
+    if port != 0 {
         builder = builder
             .clear_ip_transports()
-            .bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, options.port)))?
+            .bind_addr(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)))?
             .bind_addr_with_opts(
-                SocketAddr::from((Ipv6Addr::UNSPECIFIED, options.port)),
+                SocketAddr::from((Ipv6Addr::UNSPECIFIED, port)),
                 iroh::endpoint::BindOpts::default().set_is_required(false),
             )?;
     }
@@ -87,6 +122,8 @@ pub async fn bind(secret: SecretKey, options: &NetOptions) -> Result<Endpoint> {
 
 pub struct Node {
     endpoint: Endpoint,
+    /// Connections this device opened. Each side opens its own: streams are
+    /// only accepted on connections the other side opened.
     connections: Mutex<HashMap<DeviceId, Connection>>,
     addrs: Mutex<HashMap<DeviceId, EndpointAddr>>,
     addrs_file: PathBuf,
@@ -137,7 +174,10 @@ impl Node {
             addrs.values().cloned().collect()
         };
 
-        if let Err(e) = serde_json::to_vec_pretty(&all).map_err(anyhow::Error::from).and_then(|bytes| write_atomic(&self.addrs_file, &bytes)) {
+        if let Err(e) = serde_json::to_vec_pretty(&all)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| write_atomic(&self.addrs_file, &bytes))
+        {
             tracing::warn!("saving peer addresses: {e:#}");
         }
     }
@@ -162,23 +202,17 @@ impl Node {
             return Ok(connection.clone());
         }
 
-        let addr = lock(&self.addrs).get(&peer).cloned().unwrap_or_else(|| EndpointAddr::new(peer));
+        let addr = lock(&self.addrs)
+            .get(&peer)
+            .cloned()
+            .unwrap_or_else(|| EndpointAddr::new(peer));
         let connection = timeout(CONNECT_TIMEOUT, self.endpoint.connect(addr, ALPN))
             .await
             .context("timed out connecting")?
             .context("connecting")?;
+        tracing::debug!("connected to {}", crate::ids::short(&peer));
         lock(&self.connections).insert(peer, connection.clone());
         Ok(connection)
-    }
-
-    /// Keeps a connection a peer opened, for streams this side opens.
-    pub fn adopt(&self, connection: &Connection) {
-        let peer = connection.remote_id();
-        let mut connections = lock(&self.connections);
-        let keep = connections.get(&peer).is_none_or(|open| open.close_reason().is_some());
-        if keep {
-            connections.insert(peer, connection.clone());
-        }
     }
 
     /// Closes the connection to a peer, as when it is removed.

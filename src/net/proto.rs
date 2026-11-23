@@ -60,7 +60,9 @@ pub struct Hello {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PullMessage {
     /// First: which replica the index is, so a cursor for another starts over.
-    Start { replica: Replica },
+    Start {
+        replica: Replica,
+    },
     /// The sender's Git state, sent first and whenever it changes.
     Git(GitState),
     /// Changes up to the sender's sequence number `upto`, made while its
@@ -76,7 +78,9 @@ pub enum PullMessage {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum GetReply {
     /// The content follows: `size` bytes in all, from the asked offset on.
-    Found { size: u64 },
+    Found {
+        size: u64,
+    },
     Missing,
 }
 

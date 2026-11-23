@@ -3,11 +3,7 @@
 //! whatever order entries arrive in. See DESIGN.md, "The index".
 
 use serde::{Deserialize, Serialize};
-use std::{
-    cmp::Ordering,
-    collections::BTreeMap,
-    fmt,
-};
+use std::{cmp::Ordering, collections::BTreeMap, fmt};
 
 /// One device's copy of one folder's index.
 pub type Replica = u64;
@@ -259,7 +255,10 @@ const MAX_PATH: usize = 4096;
 pub fn valid_path(path: &str) -> bool {
     !path.is_empty()
         && path.len() <= MAX_PATH
-        && !path.split('/').next().is_some_and(|first| first.eq_ignore_ascii_case(crate::folder::OWN_DIR))
+        && !path
+            .split('/')
+            .next()
+            .is_some_and(|first| first.eq_ignore_ascii_case(crate::folder::OWN_DIR))
         && path.split('/').all(|part| {
             !part.is_empty()
                 && part != "."
@@ -385,7 +384,12 @@ impl Index {
     /// version `base`; `file` is `None` for a deletion. Returns the edit's
     /// version and the paths that changed (more than one when the edit is
     /// concurrent with an entry that arrived in the meantime).
-    pub fn edit(&mut self, path: &str, base: &Version, file: Option<FileMeta>) -> (Version, Vec<String>) {
+    pub fn edit(
+        &mut self,
+        path: &str,
+        base: &Version,
+        file: Option<FileMeta>,
+    ) -> (Version, Vec<String>) {
         self.clock += 1;
         let entry = Entry {
             path: path.to_owned(),
@@ -506,7 +510,10 @@ mod tests {
         for edit in &edits {
             deleter.merge(edit);
         }
-        let base = deleter.get("x").map(|e| e.version.clone()).unwrap_or_default();
+        let base = deleter
+            .get("x")
+            .map(|e| e.version.clone())
+            .unwrap_or_default();
         deleter.edit("x", &base, None);
         let mut sent: Vec<Entry> = edits.to_vec();
         sent.extend(deleter.since(0, usize::MAX).0);
@@ -535,14 +542,19 @@ mod tests {
         let mut replicas: Vec<Index> = (1..=4).map(Index::new).collect();
         let mut seed = 7u64;
         let mut next = |bound: u64| {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) % bound
         };
 
         for round in 0..200 {
             let at = next(4) as usize;
             let path = ["a", "b", "c"][next(3) as usize];
-            let base = replicas[at].get(path).map(|e| e.version.clone()).unwrap_or_default();
+            let base = replicas[at]
+                .get(path)
+                .map(|e| e.version.clone())
+                .unwrap_or_default();
             let file = (next(5) > 0).then(|| file(next(250) as u8, round));
             replicas[at].edit(path, &base, file);
 
@@ -571,7 +583,10 @@ mod tests {
             }
         }
 
-        let views: Vec<Vec<Entry>> = replicas.iter().map(|r| r.entries().cloned().collect()).collect();
+        let views: Vec<Vec<Entry>> = replicas
+            .iter()
+            .map(|r| r.entries().cloned().collect())
+            .collect();
         for pair in views.windows(2) {
             assert_eq!(pair[0], pair[1]);
         }
@@ -601,8 +616,14 @@ mod tests {
         // The user edits the old content.
         let (_, changed) = index.edit("a", &base, Some(file(3, 30)));
 
-        assert_eq!(changed, vec!["a (conflict 02020202)".to_owned(), "a".to_owned()]);
-        assert_eq!(index.get("a").and_then(|e| e.file.clone()), Some(file(3, 30)));
+        assert_eq!(
+            changed,
+            vec!["a (conflict 02020202)".to_owned(), "a".to_owned()]
+        );
+        assert_eq!(
+            index.get("a").and_then(|e| e.file.clone()),
+            Some(file(3, 30))
+        );
     }
 
     #[test]
@@ -610,7 +631,10 @@ mod tests {
         let mut index = Index::new(1);
         index.edit("a", &Version::default(), Some(file(1, 1)));
         index.edit("b", &Version::default(), Some(file(2, 1)));
-        let base = index.get("a").map(|e| e.version.clone()).unwrap_or_default();
+        let base = index
+            .get("a")
+            .map(|e| e.version.clone())
+            .unwrap_or_default();
         index.edit("a", &base, Some(file(3, 1)));
 
         let (entries, upto) = index.since(0, 10);
@@ -643,7 +667,10 @@ mod tests {
             assert!(is_conflict(&copy), "{copy}");
             assert_eq!(original_of(&copy).as_deref(), Some(path));
         }
-        assert_eq!(conflict_path("dir/.env", &hash), "dir/.env (conflict abababab)");
+        assert_eq!(
+            conflict_path("dir/.env", &hash),
+            "dir/.env (conflict abababab)"
+        );
         assert!(!is_conflict("notes (conflict of interest).txt"));
     }
 
@@ -651,7 +678,17 @@ mod tests {
     fn paths_from_peers_are_checked() {
         assert!(valid_path("src/main.rs"));
         assert!(valid_path("a/.gitignore"));
-        for bad in ["", "/a", "a//b", "a/../b", "./a", "a/.git/config", ".GIT", "a\\b", ".syncer/folder"] {
+        for bad in [
+            "",
+            "/a",
+            "a//b",
+            "a/../b",
+            "./a",
+            "a/.git/config",
+            ".GIT",
+            "a\\b",
+            ".syncer/folder",
+        ] {
             assert!(!valid_path(bad), "{bad}");
         }
     }

@@ -57,7 +57,9 @@ impl Rules {
     pub fn excluded(&self, path: &str, is_dir: bool) -> bool {
         let parts: Vec<&str> = path.split('/').collect();
 
-        if parts.first().is_some_and(|first| first.eq_ignore_ascii_case(OWN_DIR))
+        if parts
+            .first()
+            .is_some_and(|first| first.eq_ignore_ascii_case(OWN_DIR))
             || parts.iter().any(|part| part.eq_ignore_ascii_case(".git"))
         {
             return true;

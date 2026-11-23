@@ -26,7 +26,11 @@ use tokio::{
 /// happens, until the peer goes away.
 pub async fn pull(folder: Arc<Folder>, mut send: SendStream, cursor: Cursor) -> Result<()> {
     let replica = folder.replica();
-    let mut since = if cursor.replica == replica { cursor.seq } else { 0 };
+    let mut since = if cursor.replica == replica {
+        cursor.seq
+    } else {
+        0
+    };
     let mut seq = folder.seq();
     let mut git = folder.git_state();
     let mut caught_up = false;
@@ -43,7 +47,15 @@ pub async fn pull(folder: Arc<Folder>, mut send: SendStream, cursor: Cursor) -> 
 
         if upto > since {
             let head = folder.head_commit();
-            wire::send(&mut send, &PullMessage::Batch { entries, upto, head }).await?;
+            wire::send(
+                &mut send,
+                &PullMessage::Batch {
+                    entries,
+                    upto,
+                    head,
+                },
+            )
+            .await?;
             since = upto;
             caught_up = false;
             continue;
@@ -79,7 +91,13 @@ pub async fn pull(folder: Arc<Folder>, mut send: SendStream, cursor: Cursor) -> 
 
 /// Sends content with `hash` from `offset`, checking at the end that the
 /// file did not change while it was read.
-pub async fn get(folder: Arc<Folder>, mut send: SendStream, hash: Hash, path: String, offset: u64) -> Result<()> {
+pub async fn get(
+    folder: Arc<Folder>,
+    mut send: SendStream,
+    hash: Hash,
+    path: String,
+    offset: u64,
+) -> Result<()> {
     let content = {
         let folder = folder.clone();
         spawn_blocking(move || folder.content(&hash, &path)).await??
@@ -88,16 +106,32 @@ pub async fn get(folder: Arc<Folder>, mut send: SendStream, hash: Hash, path: St
     match content {
         None => wire::send(&mut send, &GetReply::Missing).await?,
         Some(Content::Bytes(bytes)) => {
-            let rest = bytes.get(usize::try_from(offset).unwrap_or(usize::MAX)..).unwrap_or_default();
-            wire::send(&mut send, &GetReply::Found { size: rest.len() as u64 }).await?;
+            let rest = bytes
+                .get(usize::try_from(offset).unwrap_or(usize::MAX)..)
+                .unwrap_or_default();
+            wire::send(
+                &mut send,
+                &GetReply::Found {
+                    size: rest.len() as u64,
+                },
+            )
+            .await?;
             wire::send(&mut send, &Chunk::Data(rest.to_vec())).await?;
             wire::send(&mut send, &Chunk::End).await?;
         }
         Some(Content::File { path, stat }) => {
-            let mut file = tokio::fs::File::open(&path).await.with_context(|| format!("opening {}", path.display()))?;
+            let mut file = tokio::fs::File::open(&path)
+                .await
+                .with_context(|| format!("opening {}", path.display()))?;
             let offset = offset.min(stat.size);
             file.seek(std::io::SeekFrom::Start(offset)).await?;
-            wire::send(&mut send, &GetReply::Found { size: stat.size - offset }).await?;
+            wire::send(
+                &mut send,
+                &GetReply::Found {
+                    size: stat.size - offset,
+                },
+            )
+            .await?;
             let mut buf = vec![0; CHUNK];
 
             loop {
@@ -124,7 +158,12 @@ pub async fn get(folder: Arc<Folder>, mut send: SendStream, hash: Hash, path: St
 }
 
 /// Sends a pack of `wants` without what `haves` reach.
-pub async fn pack(folder: Arc<Folder>, mut send: SendStream, wants: Vec<Oid>, haves: Vec<Oid>) -> Result<()> {
+pub async fn pack(
+    folder: Arc<Folder>,
+    mut send: SendStream,
+    wants: Vec<Oid>,
+    haves: Vec<Oid>,
+) -> Result<()> {
     let root = folder.root().to_owned();
     let prepared = spawn_blocking(move || {
         let repo = Repo::open(&root).context("this folder has no repository")?;
@@ -143,9 +182,18 @@ pub async fn pack(folder: Arc<Folder>, mut send: SendStream, wants: Vec<Oid>, ha
         .kill_on_drop(true)
         .spawn()
         .context("running git pack-objects")?;
-    let mut stdin = child.stdin.take().context("git pack-objects has no input")?;
-    let mut stdout = child.stdout.take().context("git pack-objects has no output")?;
-    let mut stderr = child.stderr.take().context("git pack-objects has no error output")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("git pack-objects has no input")?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("git pack-objects has no output")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("git pack-objects has no error output")?;
     let feed = tokio::spawn(async move {
         let _ = stdin.write_all(&input).await;
     });
@@ -169,7 +217,10 @@ pub async fn pack(folder: Arc<Folder>, mut send: SendStream, wants: Vec<Oid>, ha
     let last = if status.success() {
         Chunk::End
     } else {
-        Chunk::Failed(format!("git pack-objects failed: {}", errors.await.unwrap_or_default().trim()))
+        Chunk::Failed(format!(
+            "git pack-objects failed: {}",
+            errors.await.unwrap_or_default().trim()
+        ))
     };
     wire::send(&mut send, &last).await?;
     send.finish()?;

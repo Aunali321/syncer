@@ -20,7 +20,13 @@ use tokio::{
 
 /// Fetches content `hash` (wanted at `path`) from the first of `peers` that
 /// has it, into the folder's downloads.
-pub async fn content(node: &Node, folder: &Arc<Folder>, peers: &[DeviceId], hash: Hash, path: &str) -> Result<()> {
+pub async fn content(
+    node: &Node,
+    folder: &Arc<Folder>,
+    peers: &[DeviceId],
+    hash: Hash,
+    path: &str,
+) -> Result<()> {
     let mut last = None;
 
     for peer in peers {
@@ -31,7 +37,11 @@ pub async fn content(node: &Node, folder: &Arc<Folder>, peers: &[DeviceId], hash
         match attempt.await {
             Ok(()) => return Ok(()),
             Err(e) => {
-                tracing::debug!("{}: {path} from {}: {e:#}", folder.id, crate::ids::short(peer));
+                tracing::debug!(
+                    "{}: {path} from {}: {e:#}",
+                    folder.id,
+                    crate::ids::short(peer)
+                );
                 last = Some(e);
             }
         }
@@ -40,9 +50,17 @@ pub async fn content(node: &Node, folder: &Arc<Folder>, peers: &[DeviceId], hash
     Err(last.unwrap_or_else(|| anyhow::anyhow!("no peer that holds this folder is reachable")))
 }
 
-async fn content_from(connection: &Connection, folder: &Arc<Folder>, hash: Hash, path: &str) -> Result<()> {
+async fn content_from(
+    connection: &Connection,
+    folder: &Arc<Folder>,
+    hash: Hash,
+    path: &str,
+) -> Result<()> {
     let (part, done) = folder.download_paths(&hash);
-    let offset = tokio::fs::metadata(&part).await.map(|meta| meta.len()).unwrap_or(0);
+    let offset = tokio::fs::metadata(&part)
+        .await
+        .map(|meta| meta.len())
+        .unwrap_or(0);
     let (mut send, mut recv) = connection.open_bi().await?;
     wire::send(
         &mut send,
@@ -122,7 +140,12 @@ fn hash_prefix(part: &Path) -> Result<blake3::Hasher> {
 
 /// Fetches a pack of `wants` (without what `haves` reach) from the peer at
 /// the other end of `connection` into the folder's repository.
-pub async fn pack(connection: &Connection, folder: &Arc<Folder>, wants: Vec<Oid>, haves: Vec<Oid>) -> Result<()> {
+pub async fn pack(
+    connection: &Connection,
+    folder: &Arc<Folder>,
+    wants: Vec<Oid>,
+    haves: Vec<Oid>,
+) -> Result<()> {
     let repo = Repo::open(folder.root()).context("the folder has no repository")?;
     let (mut send, mut recv) = connection.open_bi().await?;
     wire::send(
@@ -141,7 +164,10 @@ pub async fn pack(connection: &Connection, folder: &Arc<Folder>, wants: Vec<Oid>
         .spawn()
         .context("running git index-pack")?;
     let mut stdin = child.stdin.take().context("git index-pack has no input")?;
-    let mut stderr = child.stderr.take().context("git index-pack has no error output")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("git index-pack has no error output")?;
     let errors = tokio::spawn(async move {
         let mut text = String::new();
         let _ = stderr.read_to_string(&mut text).await;
@@ -159,7 +185,10 @@ pub async fn pack(connection: &Connection, folder: &Arc<Folder>, wants: Vec<Oid>
     drop(stdin);
     let status = child.wait().await?;
     if !status.success() {
-        bail!("git index-pack failed: {}", errors.await.unwrap_or_default().trim());
+        bail!(
+            "git index-pack failed: {}",
+            errors.await.unwrap_or_default().trim()
+        );
     }
     Ok(())
 }

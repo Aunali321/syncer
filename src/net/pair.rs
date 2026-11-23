@@ -25,11 +25,19 @@ pub struct Ticket {
 impl Ticket {
     pub fn encode(&self) -> String {
         let bytes = rmp_serde::to_vec(self).expect("a ticket always encodes");
-        format!("{PREFIX}{}", data_encoding::BASE32_NOPAD.encode(&bytes).to_ascii_lowercase())
+        format!(
+            "{PREFIX}{}",
+            data_encoding::BASE32_NOPAD
+                .encode(&bytes)
+                .to_ascii_lowercase()
+        )
     }
 
     pub fn decode(text: &str) -> Result<Self> {
-        let body = text.trim().strip_prefix(PREFIX).context("not a syncer invite")?;
+        let body = text
+            .trim()
+            .strip_prefix(PREFIX)
+            .context("not a syncer invite")?;
         let bytes = data_encoding::BASE32_NOPAD
             .decode(body.to_ascii_uppercase().as_bytes())
             .context("the invite is damaged")?;
@@ -54,7 +62,9 @@ impl Invites {
 
     /// Uses up the invite with `secret`, if it is open.
     pub fn redeem(&self, secret: &[u8; 32]) -> Result<()> {
-        let expires = lock(&self.open).remove(secret).context("unknown or used invite")?;
+        let expires = lock(&self.open)
+            .remove(secret)
+            .context("unknown or used invite")?;
         ensure!(expires > Instant::now(), "the invite has expired");
         Ok(())
     }

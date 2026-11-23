@@ -86,7 +86,9 @@ pub fn observe(repo: &Repo, memory: &mut Memory, me: [u8; 32]) -> Result<bool> {
         }
     }
 
-    memory.tombstones.retain(|name, _| !branches.contains_key(name));
+    memory
+        .tombstones
+        .retain(|name, _| !branches.contains_key(name));
     memory.known = branches;
 
     match &memory.head {
@@ -107,7 +109,10 @@ pub fn observe(repo: &Repo, memory: &mut Memory, me: [u8; 32]) -> Result<bool> {
             // beats it.
             memory.head = Some(HeadRecord {
                 target: head,
-                stamp: Stamp { lamport: 0, device: me },
+                stamp: Stamp {
+                    lamport: 0,
+                    device: me,
+                },
             });
             changed = true;
         }
@@ -183,11 +188,18 @@ pub fn wants(repo: &Repo, peer: &GitState) -> Result<(Vec<Oid>, Vec<Oid>)> {
 
 /// Settles `peer`'s state into this repository, once the objects `wants`
 /// named are here. `peer_label` names the peer in conflict refs.
-pub fn align(repo: &Repo, memory: &mut Memory, peer: &GitState, peer_label: &str) -> Result<Aligned> {
+pub fn align(
+    repo: &Repo,
+    memory: &mut Memory,
+    peer: &GitState,
+    peer_label: &str,
+) -> Result<Aligned> {
     let mut aligned = Aligned::default();
 
     if let Some(operation) = repo.busy() {
-        aligned.notes.push(format!("waiting for a Git operation to finish ({operation})"));
+        aligned.notes.push(format!(
+            "waiting for a Git operation to finish ({operation})"
+        ));
         return Ok(aligned);
     }
 
@@ -199,11 +211,15 @@ pub fn align(repo: &Repo, memory: &mut Memory, peer: &GitState, peer_label: &str
 
     for (name, tip) in &peer.branches {
         if !valid_branch(name) {
-            aligned.notes.push(format!("ignoring the branch name {name:?}"));
+            aligned
+                .notes
+                .push(format!("ignoring the branch name {name:?}"));
             continue;
         }
         if !repo.complete(tip)? {
-            aligned.notes.push(format!("{name}: the peer's commits did not all arrive"));
+            aligned
+                .notes
+                .push(format!("{name}: the peer's commits did not all arrive"));
             continue;
         }
 
@@ -259,7 +275,9 @@ pub fn align(repo: &Repo, memory: &mut Memory, peer: &GitState, peer_label: &str
                     continue;
                 }
                 if checked_out.as_deref() == Some(name.as_str()) {
-                    aligned.notes.push(format!("{name} was deleted elsewhere but is checked out here"));
+                    aligned.notes.push(format!(
+                        "{name} was deleted elsewhere but is checked out here"
+                    ));
                     continue;
                 }
                 repo.delete_ref(&format!("{HEADS}{name}"), &local)?;
@@ -268,7 +286,9 @@ pub fn align(repo: &Repo, memory: &mut Memory, peer: &GitState, peer_label: &str
             }
             None => {
                 let newer = match memory.tombstones.get(name) {
-                    Some(ours) => repo.has(ours)? && repo.contains(deleted, ours)? && ours != deleted,
+                    Some(ours) => {
+                        repo.has(ours)? && repo.contains(deleted, ours)? && ours != deleted
+                    }
                     None => true,
                 };
                 if newer {
@@ -288,10 +308,15 @@ pub fn align(repo: &Repo, memory: &mut Memory, peer: &GitState, peer_label: &str
 
     if let Some(theirs) = &peer.head {
         memory.lamport = memory.lamport.max(theirs.stamp.lamport);
-        let newer = memory.head.as_ref().is_none_or(|ours| theirs.stamp > ours.stamp);
+        let newer = memory
+            .head
+            .as_ref()
+            .is_none_or(|ours| theirs.stamp > ours.stamp);
 
         if newer {
-            if memory.head.as_ref().map(|ours| &ours.target) != Some(&theirs.target) || repo.head()? != theirs.target {
+            if memory.head.as_ref().map(|ours| &ours.target) != Some(&theirs.target)
+                || repo.head()? != theirs.target
+            {
                 match head_ready(repo, &theirs.target)? {
                     Ok(()) => {
                         repo.set_head(&theirs.target)?;
@@ -318,7 +343,9 @@ pub fn align(repo: &Repo, memory: &mut Memory, peer: &GitState, peer_label: &str
 /// Whether HEAD can point at `target` now, or why not.
 fn head_ready(repo: &Repo, target: &HeadTarget) -> Result<Result<(), String>> {
     Ok(match target {
-        HeadTarget::Branch(branch) if !valid_branch(branch) => Err(format!("ignoring the branch name {branch:?}")),
+        HeadTarget::Branch(branch) if !valid_branch(branch) => {
+            Err(format!("ignoring the branch name {branch:?}"))
+        }
         // An unborn branch is fine: a new repository's HEAD names one.
         HeadTarget::Branch(_) => Ok(()),
         HeadTarget::Detached(oid) if repo.complete(oid)? => Ok(()),
@@ -331,7 +358,10 @@ pub fn diverged(repo: &Repo) -> Result<Vec<Diverged>> {
     let mut out = Vec::new();
 
     for (reference, tip) in repo.refs(CONFLICTS)? {
-        let Some((_, branch)) = reference.strip_prefix(CONFLICTS).and_then(|rest| rest.split_once('/')) else {
+        let Some((_, branch)) = reference
+            .strip_prefix(CONFLICTS)
+            .and_then(|rest| rest.split_once('/'))
+        else {
             continue;
         };
         out.push(Diverged {
@@ -381,9 +411,9 @@ pub fn valid_branch(name: &str) -> bool {
         && !name.contains("@{")
         && !name.contains("/.")
         && name != "@"
-        && name
-            .chars()
-            .all(|c| !c.is_control() && !matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+        && name.chars().all(|c| {
+            !c.is_control() && !matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+        })
 }
 
 /// A peer label for conflict refs: the first characters of its id.
@@ -407,7 +437,10 @@ pub fn copy_objects(from: &Repo, to: &Repo, wants: &[Oid], haves: &[Oid]) -> Res
     drop(input);
     let status = pack.wait()?;
     if !status.success() {
-        bail!("git pack-objects failed: {}", errors.join().unwrap_or_default().trim());
+        bail!(
+            "git pack-objects failed: {}",
+            errors.join().unwrap_or_default().trim()
+        );
     }
     super::repo::finish(unpack, "index-pack")
 }
@@ -462,7 +495,10 @@ mod tests {
         assert_eq!(b.refs(HEADS).expect("refs"), a.refs(HEADS).expect("refs"));
         assert_eq!(b.refs(TAGS).expect("refs"), a.refs(TAGS).expect("refs"));
         assert_eq!(b.head().expect("HEAD"), HeadTarget::Branch("main".into()));
-        assert_eq!(b.head_commit().expect("HEAD"), a.head_commit().expect("HEAD"));
+        assert_eq!(
+            b.head_commit().expect("HEAD"),
+            a.head_commit().expect("HEAD")
+        );
         assert!(aligned.diverged.is_empty());
         assert!(aligned.checkout_moved);
     }
@@ -475,7 +511,10 @@ mod tests {
 
         let ahead = commit(&a, "ahead");
         sync(&a, &mut am, &b, &mut bm);
-        assert_eq!(b.resolve("refs/heads/main").expect("ref"), Some(ahead.clone()));
+        assert_eq!(
+            b.resolve("refs/heads/main").expect("ref"),
+            Some(ahead.clone())
+        );
         // The index follows: nothing staged against the new commit's tree but
         // the file itself, which file sync brings.
         assert_eq!(git(&b, &["diff", "--cached", "--name-only"]).trim(), "");
@@ -503,16 +542,35 @@ mod tests {
 
         let aligned = sync(&a, &mut am, &b, &mut bm);
         assert_eq!(aligned.diverged.len(), 1);
-        assert_eq!(aligned.diverged[0].reference, "refs/syncer/conflicts/a/main");
+        assert_eq!(
+            aligned.diverged[0].reference,
+            "refs/syncer/conflicts/a/main"
+        );
         assert_eq!(b.resolve("refs/heads/main").expect("ref"), Some(ours));
-        assert_eq!(b.resolve("refs/syncer/conflicts/a/main").expect("ref"), Some(theirs));
+        assert_eq!(
+            b.resolve("refs/syncer/conflicts/a/main").expect("ref"),
+            Some(theirs)
+        );
 
-        git(&b, &["merge", "-q", "--no-edit", "-X", "theirs", "refs/syncer/conflicts/a/main"]);
+        git(
+            &b,
+            &[
+                "merge",
+                "-q",
+                "--no-edit",
+                "-X",
+                "theirs",
+                "refs/syncer/conflicts/a/main",
+            ],
+        );
         observe(&b, &mut bm, B).expect("observed");
         assert!(diverged(&b).expect("diverged").is_empty());
 
         // a takes the merge as a fast-forward.
-        let (b_state, merged) = (advertise(&b, &bm).expect("state"), b.head_commit().expect("HEAD"));
+        let (b_state, merged) = (
+            advertise(&b, &bm).expect("state"),
+            b.head_commit().expect("HEAD"),
+        );
         let (wants, haves) = wants(&a, &b_state).expect("wants");
         copy_objects(&b, &a, &wants, &haves).expect("copied");
         align(&a, &mut am, &b_state, "b").expect("aligned");
@@ -565,7 +623,10 @@ mod tests {
         git(&a, &["checkout", "-q", "topic"]);
         sync(&a, &mut am, &b, &mut bm);
         assert_eq!(b.head().expect("HEAD"), HeadTarget::Branch("topic".into()));
-        assert_eq!(std::fs::read_to_string(b.root().join("file.txt")).expect("read"), "first");
+        assert_eq!(
+            std::fs::read_to_string(b.root().join("file.txt")).expect("read"),
+            "first"
+        );
 
         // b switching back is newer than a's switch and wins on a.
         git(&b, &["checkout", "-q", "main"]);
@@ -595,7 +656,10 @@ mod tests {
         for good in ["main", "feature/x", "v1.2", "release-2024"] {
             assert!(valid_branch(good), "{good}");
         }
-        for bad in ["", "-x", "a..b", "a b", "a~1", "x.lock", "a/", "/a", ".a", "a/.b", "a@{1}", "a\\b", "@"] {
+        for bad in [
+            "", "-x", "a..b", "a b", "a~1", "x.lock", "a/", "/a", ".a", "a/.b", "a@{1}", "a\\b",
+            "@",
+        ] {
             assert!(!valid_branch(bad), "{bad}");
         }
     }

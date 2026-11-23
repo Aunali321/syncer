@@ -6,12 +6,7 @@ use crate::folder::{
     disk::{self, Stat},
     rules::Rules,
 };
-use std::{
-    collections::BTreeMap,
-    fs,
-    io::ErrorKind,
-    path::Path,
-};
+use std::{collections::BTreeMap, fs, io::ErrorKind, path::Path};
 
 /// What a walk found.
 #[derive(Debug, Default)]
@@ -83,7 +78,11 @@ pub fn walk(root: &Path, rules: &Rules, scope: &Scope) -> Walked {
 
 fn walk_dir(root: &Path, dir: &str, rules: &Rules, walked: &mut Walked) {
     let full = disk::join(root, dir);
-    let full = if dir.is_empty() { root.to_owned() } else { full };
+    let full = if dir.is_empty() {
+        root.to_owned()
+    } else {
+        full
+    };
     let entries = match fs::read_dir(&full) {
         Ok(entries) => entries,
         Err(e) => {

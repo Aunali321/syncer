@@ -53,8 +53,14 @@ impl Disk {
 
     pub fn insert(&mut self, path: String, file: LocalFile) {
         self.remove(&path);
-        self.by_hash.entry(file.meta.hash).or_default().insert(path.clone());
-        self.by_lower.entry(path.to_lowercase()).or_default().insert(path.clone());
+        self.by_hash
+            .entry(file.meta.hash)
+            .or_default()
+            .insert(path.clone());
+        self.by_lower
+            .entry(path.to_lowercase())
+            .or_default()
+            .insert(path.clone());
         self.files.insert(path, file);
     }
 
@@ -72,7 +78,9 @@ impl Disk {
             Some(path) => path,
             None => paths.iter().next()?,
         };
-        self.files.get_key_value(path).map(|(path, file)| (path.as_str(), file))
+        self.files
+            .get_key_value(path)
+            .map(|(path, file)| (path.as_str(), file))
     }
 
     /// Another path on disk whose name differs from `path` only by case.
@@ -153,7 +161,11 @@ pub enum Work {
     /// The disk has the target content but an older version: record it.
     Adopt(Version),
     /// Write `entry`'s file at its path, which holds `expected` now.
-    Place { entry: Entry, meta: FileMeta, expected: Option<Stat> },
+    Place {
+        entry: Entry,
+        meta: FileMeta,
+        expected: Option<Stat>,
+    },
     /// Delete the file, which holds `expected` now.
     Remove { version: Version, expected: Stat },
 }
@@ -313,15 +325,26 @@ impl State {
     /// content. Content the index already has for the path is adopted
     /// without an edit.
     fn record(&mut self, path: String, found: Option<(FileMeta, Stat)>) {
-        let base = self.disk.get(&path).map(|file| file.version.clone()).unwrap_or_default();
+        let base = self
+            .disk
+            .get(&path)
+            .map(|file| file.version.clone())
+            .unwrap_or_default();
         let indexed = self.index.get(&path);
 
         match found {
             Some((meta, stat)) => {
-                let same_as_disk = self.disk.get(&path).is_some_and(|file| file.meta.same_content(&meta));
-                let same_as_index = indexed.and_then(|entry| entry.file.as_ref()).is_some_and(|file| file.same_content(&meta));
+                let same_as_disk = self
+                    .disk
+                    .get(&path)
+                    .is_some_and(|file| file.meta.same_content(&meta));
+                let same_as_index = indexed
+                    .and_then(|entry| entry.file.as_ref())
+                    .is_some_and(|file| file.same_content(&meta));
                 let version = if same_as_index {
-                    indexed.map(|entry| entry.version.clone()).unwrap_or_default()
+                    indexed
+                        .map(|entry| entry.version.clone())
+                        .unwrap_or_default()
                 } else if same_as_disk {
                     // Touched, or a stat that moved without a change.
                     base
@@ -331,10 +354,20 @@ impl State {
                     version
                 };
                 let meta = match self.disk.get(&path) {
-                    Some(file) if file.meta.same_content(&meta) => FileMeta { mtime_ms: file.meta.mtime_ms, ..meta },
+                    Some(file) if file.meta.same_content(&meta) => FileMeta {
+                        mtime_ms: file.meta.mtime_ms,
+                        ..meta
+                    },
                     _ => meta,
                 };
-                self.disk.insert(path, LocalFile { meta, stat, version });
+                self.disk.insert(
+                    path,
+                    LocalFile {
+                        meta,
+                        stat,
+                        version,
+                    },
+                );
             }
             None => {
                 self.disk.remove(&path);
@@ -400,7 +433,14 @@ impl State {
     }
 
     pub fn placed(&mut self, path: &str, meta: FileMeta, stat: Stat, version: Version) {
-        self.disk.insert(path.to_owned(), LocalFile { meta, stat, version });
+        self.disk.insert(
+            path.to_owned(),
+            LocalFile {
+                meta,
+                stat,
+                version,
+            },
+        );
     }
 
     pub fn removed(&mut self, path: &str) {
@@ -421,7 +461,9 @@ impl State {
         self.index
             .entries()
             .filter_map(|entry| entry.file.as_ref())
-            .fold((0, 0), |(files, bytes), file| (files + 1, bytes + file.size))
+            .fold((0, 0), |(files, bytes), file| {
+                (files + 1, bytes + file.size)
+            })
     }
 }
 
@@ -465,13 +507,22 @@ mod tests {
         let seq = state.index.seq();
 
         scan(&mut state, root);
-        assert_eq!(state.index.seq(), seq, "an unchanged folder records nothing");
+        assert_eq!(
+            state.index.seq(),
+            seq,
+            "an unchanged folder records nothing"
+        );
 
         fs::write(root.join("a"), "uno").expect("write");
         fs::remove_file(root.join("b")).expect("remove");
         scan(&mut state, root);
         assert_eq!(content(&state, "a"), Some(Hash::of(b"uno")));
-        assert!(state.index.get("b").is_some_and(|entry| entry.file.is_none()));
+        assert!(
+            state
+                .index
+                .get("b")
+                .is_some_and(|entry| entry.file.is_none())
+        );
         assert!(state.disk.get("b").is_none());
     }
 
@@ -488,7 +539,13 @@ mod tests {
         fs::write(root.join(".gitignore"), "*.log\n").expect("write");
         scan(&mut state, root);
         assert!(state.disk.get("build.log").is_none());
-        assert!(state.index.get("build.log").and_then(|entry| entry.file.as_ref()).is_some());
+        assert!(
+            state
+                .index
+                .get("build.log")
+                .and_then(|entry| entry.file.as_ref())
+                .is_some()
+        );
     }
 
     #[test]
@@ -512,7 +569,11 @@ mod tests {
                 executable: false,
             }),
         };
-        let drop_version = state.index.get("drop").map(|entry| entry.version.with(2, 1)).unwrap_or_default();
+        let drop_version = state
+            .index
+            .get("drop")
+            .map(|entry| entry.version.with(2, 1))
+            .unwrap_or_default();
         let delete = Entry {
             path: "drop".into(),
             version: drop_version,
@@ -522,7 +583,10 @@ mod tests {
 
         assert_eq!(changed, ["new", "drop"]);
         assert_eq!(state.work("keep", &rules), Work::Done);
-        assert!(matches!(state.work("new", &rules), Work::Place { expected: None, .. }));
+        assert!(matches!(
+            state.work("new", &rules),
+            Work::Place { expected: None, .. }
+        ));
         assert!(matches!(state.work("drop", &rules), Work::Remove { .. }));
     }
 
@@ -549,7 +613,10 @@ mod tests {
         scan(&mut state, root);
 
         assert_eq!(state.index.seq(), seq, "no edit for content the index has");
-        assert_eq!(state.disk.get("same").map(|file| file.version.clone()), Some(theirs.version));
+        assert_eq!(
+            state.disk.get("same").map(|file| file.version.clone()),
+            Some(theirs.version)
+        );
     }
 
     #[test]
@@ -588,10 +655,16 @@ mod tests {
         disk.insert("Readme.md".into(), file(1));
         disk.insert("b".into(), file(1));
 
-        assert_eq!(disk.holding(&Hash([1; 32]), "b").map(|(path, _)| path), Some("b"));
+        assert_eq!(
+            disk.holding(&Hash([1; 32]), "b").map(|(path, _)| path),
+            Some("b")
+        );
         assert_eq!(disk.case_clash("README.md"), Some("Readme.md"));
         assert_eq!(disk.case_clash("Readme.md"), None);
         disk.remove("b");
-        assert_eq!(disk.holding(&Hash([1; 32]), "b").map(|(path, _)| path), Some("Readme.md"));
+        assert_eq!(
+            disk.holding(&Hash([1; 32]), "b").map(|(path, _)| path),
+            Some("Readme.md")
+        );
     }
 }

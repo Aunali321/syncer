@@ -49,7 +49,9 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { use_gitignore: true }
+        Self {
+            use_gitignore: true,
+        }
     }
 }
 
@@ -58,8 +60,9 @@ impl Default for Settings {
 pub struct Problems {
     /// Paths that could not be brought in line, with why.
     pub files: BTreeMap<String, String>,
-    /// Notes from Git sync: diverged branches, operations waited for.
-    pub git: Vec<String>,
+    /// Notes from Git sync with each peer: diverged branches, operations
+    /// waited for.
+    pub git: BTreeMap<DeviceId, Vec<String>>,
     /// Peers whose changes are held back, with why.
     pub waiting: BTreeMap<DeviceId, String>,
 }
@@ -107,9 +110,16 @@ impl Folder {
     /// folder this device synced before must still carry its marker: a
     /// missing or foreign marker means an unmounted disk or a replaced
     /// directory, and nothing is touched.
-    pub fn open(id: FolderId, root: &Path, state_path: &Path, me: [u8; 32], settings: Settings) -> Result<Arc<Self>> {
+    pub fn open(
+        id: FolderId,
+        root: &Path,
+        state_path: &Path,
+        me: [u8; 32],
+        settings: Settings,
+    ) -> Result<Arc<Self>> {
         let state = match fs::read(state_path) {
-            Ok(bytes) => State::decode(&bytes).with_context(|| format!("reading {}", state_path.display()))?,
+            Ok(bytes) => State::decode(&bytes)
+                .with_context(|| format!("reading {}", state_path.display()))?,
             Err(e) if e.kind() == ErrorKind::NotFound => State::new(rand::random::<Replica>()),
             Err(e) => return Err(e).with_context(|| format!("reading {}", state_path.display())),
         };
@@ -213,7 +223,8 @@ impl Folder {
 
         let root = self.root.clone();
         let settings = self.settings;
-        let rules = spawn_blocking(move || Arc::new(Rules::new(&root, settings.use_gitignore))).await?;
+        let rules =
+            spawn_blocking(move || Arc::new(Rules::new(&root, settings.use_gitignore))).await?;
         *lock(&self.rules) = rules.clone();
 
         let walked = {
@@ -290,12 +301,20 @@ impl Folder {
     }
 
     pub fn head_commit(&self) -> Option<git::Oid> {
-        self.git.borrow().as_ref().and_then(|state| state.head_commit.clone())
+        self.git
+            .borrow()
+            .as_ref()
+            .and_then(|state| state.head_commit.clone())
     }
 
     /// Settles a peer's Git state here. `fetch_pack` brings the objects it
     /// needs into the repository at the folder root: `(wants, haves)`.
-    pub async fn align_git<F, Fut>(self: &Arc<Self>, peer: &DeviceId, theirs: &GitState, fetch_pack: F) -> Result<()>
+    pub async fn align_git<F, Fut>(
+        self: &Arc<Self>,
+        peer: &DeviceId,
+        theirs: &GitState,
+        fetch_pack: F,
+    ) -> Result<()>
     where
         F: FnOnce(Vec<git::Oid>, Vec<git::Oid>) -> Fut,
         Fut: Future<Output = Result<()>>,
@@ -315,7 +334,9 @@ impl Folder {
         .await??;
 
         if !wants.is_empty() {
-            fetch_pack(wants, haves).await.context("fetching Git objects")?;
+            fetch_pack(wants, haves)
+                .await
+                .context("fetching Git objects")?;
         }
 
         let mut memory = lock(&self.state).git.clone();
@@ -328,21 +349,24 @@ impl Folder {
         })
         .await??;
 
+        let notes: Vec<String> = aligned
+            .diverged
+            .iter()
+            .map(|diverged| {
+                format!(
+                    "branch {} diverged; merge it with: git merge {}",
+                    diverged.branch, diverged.reference
+                )
+            })
+            .chain(aligned.notes.iter().cloned())
+            .collect();
         {
             let mut problems = lock(&self.problems);
-            problems.git = aligned
-                .diverged
-                .iter()
-                .map(|diverged| {
-                    format!(
-                        "branch {} diverged from {}; merge it with: git merge {}",
-                        diverged.branch,
-                        crate::ids::short(peer),
-                        diverged.reference
-                    )
-                })
-                .chain(aligned.notes.iter().cloned())
-                .collect();
+            if notes.is_empty() {
+                problems.git.remove(peer);
+            } else {
+                problems.git.insert(*peer, notes);
+            }
         }
 
         if aligned.checkout_moved {
@@ -365,7 +389,11 @@ impl Folder {
     }
 
     pub fn cursor(&self, peer: &DeviceId) -> Cursor {
-        lock(&self.state).cursors.get(peer).copied().unwrap_or_default()
+        lock(&self.state)
+            .cursors
+            .get(peer)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Whether a peer's changes, made while its checkout was at `head`, can
@@ -442,7 +470,11 @@ impl Folder {
                     round.done += 1;
                 }
                 Work::Remove { version, expected } => removals.push((path, version, expected)),
-                Work::Place { entry, meta, expected } => match self.place(&path, &entry, &meta, expected).await {
+                Work::Place {
+                    entry,
+                    meta,
+                    expected,
+                } => match self.place(&path, &entry, &meta, expected).await {
                     Ok(true) => {
                         round.done += 1;
                         lock(&self.problems).files.remove(&path);
@@ -487,12 +519,20 @@ impl Folder {
 
     /// Places `meta`'s content at `path` if it is at hand: downloaded, or in
     /// another file here. Returns `false` when it must be fetched first.
-    async fn place(self: &Arc<Self>, path: &str, entry: &Entry, meta: &FileMeta, expected: Option<disk::Stat>) -> Result<bool> {
+    async fn place(
+        self: &Arc<Self>,
+        path: &str,
+        entry: &Entry,
+        meta: &FileMeta,
+        expected: Option<disk::Stat>,
+    ) -> Result<bool> {
         if expected.is_none()
             && self.case_insensitive
             && let Some(other) = lock(&self.state).disk.case_clash(path)
         {
-            bail!("{other} is already here, and this file system does not tell the two names apart");
+            bail!(
+                "{other} is already here, and this file system does not tell the two names apart"
+            );
         }
 
         let (_, done) = self.download_paths(&meta.hash);
@@ -618,7 +658,11 @@ impl Folder {
             bytes,
             pending,
             conflicts: state.conflicts(),
-            head: self.git.borrow().as_ref().and_then(|git| git.head.as_ref().map(|head| head.target.clone())),
+            head: self
+                .git
+                .borrow()
+                .as_ref()
+                .and_then(|git| git.head.as_ref().map(|head| head.target.clone())),
             head_commit: self.head_commit(),
         }
     }
@@ -656,7 +700,8 @@ fn check_root(id: &FolderId, root: &Path, has_history: bool) -> Result<()> {
                     root.display()
                 );
             }
-            fs::create_dir_all(root.join(OWN_DIR)).with_context(|| format!("making {}", root.display()))?;
+            fs::create_dir_all(root.join(OWN_DIR))
+                .with_context(|| format!("making {}", root.display()))?;
             write_atomic(&marker, id.as_str().as_bytes())
         }
         Err(e) => Err(e).with_context(|| format!("reading {}", marker.display())),

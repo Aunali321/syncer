@@ -10,7 +10,11 @@ pub const MAX_MESSAGE: usize = 16 << 20;
 
 pub async fn send<T: Serialize>(out: &mut (impl AsyncWrite + Unpin), message: &T) -> Result<()> {
     let bytes = rmp_serde::to_vec_named(message).context("encoding a message")?;
-    ensure!(bytes.len() <= MAX_MESSAGE, "a message of {} bytes is too large", bytes.len());
+    ensure!(
+        bytes.len() <= MAX_MESSAGE,
+        "a message of {} bytes is too large",
+        bytes.len()
+    );
     let len = u32::try_from(bytes.len()).context("a message too large")?;
     out.write_all(&len.to_be_bytes()).await?;
     out.write_all(&bytes).await?;
@@ -31,8 +35,13 @@ pub async fn recv<T: DeserializeOwned>(input: &mut (impl AsyncRead + Unpin)) -> 
     let len = u32::from_be_bytes(len) as usize;
     ensure!(len <= MAX_MESSAGE, "a message of {len} bytes is too large");
     let mut bytes = vec![0; len];
-    input.read_exact(&mut bytes).await.context("reading a message")?;
-    rmp_serde::from_slice(&bytes).context("decoding a message").map(Some)
+    input
+        .read_exact(&mut bytes)
+        .await
+        .context("reading a message")?;
+    rmp_serde::from_slice(&bytes)
+        .context("decoding a message")
+        .map(Some)
 }
 
 /// The next message, failing when the stream ends.
@@ -52,6 +61,11 @@ mod tests {
 
         let got: (String, u32) = expect(&mut b).await.expect("received");
         assert_eq!(got, ("hello".to_owned(), 42));
-        assert!(recv::<(String, u32)>(&mut b).await.expect("clean end").is_none());
+        assert!(
+            recv::<(String, u32)>(&mut b)
+                .await
+                .expect("clean end")
+                .is_none()
+        );
     }
 }

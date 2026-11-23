@@ -3,6 +3,7 @@
 
 use crate::{
     folder::{Folder, state::Cursor},
+    git::Oid,
     ids::{DeviceId, short},
     net::{
         node::Node,
@@ -13,19 +14,10 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use std::{sync::Arc, time::Duration};
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 
 /// The longest wait between attempts to reach a peer.
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
-/// How long a puller held back by Git waits before asking again, unless the
-/// checkout here moves first.
-const RECHECK: Duration = Duration::from_secs(30);
-
-/// How a pull ended.
-enum Ended {
-    /// The peer's checkout is elsewhere; wait for Git to catch up.
-    HeldBack,
-}
 
 /// Follows `peer`'s index of `folder` until the task is stopped.
 pub async fn follow(node: Arc<Node>, folder: Arc<Folder>, peer: DeviceId) {
@@ -33,15 +25,11 @@ pub async fn follow(node: Arc<Node>, folder: Arc<Folder>, peer: DeviceId) {
 
     loop {
         match once(&node, &folder, peer).await {
-            Ok(Ended::HeldBack) => {
-                backoff = Duration::from_secs(1);
-                let mut git = folder.git_state();
-                git.borrow_and_update();
-                let _ = timeout(RECHECK, git.changed()).await;
-            }
+            // The checkouts met again: pull from the cursor at once.
+            Ok(()) => backoff = Duration::from_secs(1),
             Err(e) => {
                 tracing::debug!("{}: pulling from {}: {e:#}", folder.id, short(&peer));
-                folder.set_waiting(&peer, Some(format!("unreachable: {e:#}")));
+                folder.set_waiting(&peer, Some(format!("not reachable: {e:#}")));
                 sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
             }
@@ -49,7 +37,9 @@ pub async fn follow(node: Arc<Node>, folder: Arc<Folder>, peer: DeviceId) {
     }
 }
 
-async fn once(node: &Node, folder: &Arc<Folder>, peer: DeviceId) -> Result<Ended> {
+/// Pulls until the stream fails, or until changes that were held back can
+/// be taken (`Ok`), which needs a fresh pull from the cursor.
+async fn once(node: &Node, folder: &Arc<Folder>, peer: DeviceId) -> Result<()> {
     let connection = node.connect(peer).await?;
     let (mut send, mut recv) = connection.open_bi().await?;
     let mut cursor = folder.cursor(&peer);
@@ -62,8 +52,25 @@ async fn once(node: &Node, folder: &Arc<Folder>, peer: DeviceId) -> Result<Ended
     )
     .await?;
 
+    let mut local_git = folder.git_state();
+    local_git.borrow_and_update();
+    // While held, batches are skipped and the cursor stays where it was.
+    let mut held = false;
+    let mut peer_head: Option<Oid> = None;
+
     loop {
-        let Some(message) = wire::recv::<PullMessage>(&mut recv).await? else {
+        let message = tokio::select! {
+            message = wire::recv::<PullMessage>(&mut recv) => message?,
+            changed = local_git.changed() => {
+                changed?;
+                local_git.borrow_and_update();
+                if held && folder.accepts(peer_head.as_ref()) {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        let Some(message) = message else {
             bail!("the peer closed the stream");
         };
 
@@ -74,24 +81,40 @@ async fn once(node: &Node, folder: &Arc<Folder>, peer: DeviceId) -> Result<Ended
                 }
             }
             PullMessage::Git(state) => {
+                peer_head = state.head_commit.clone();
                 let aligned = folder
-                    .align_git(&peer, &state, |wants, haves| fetch::pack(&connection, folder, wants, haves))
+                    .align_git(&peer, &state, |wants, haves| {
+                        fetch::pack(&connection, folder, wants, haves)
+                    })
                     .await;
                 if let Err(e) = aligned {
                     tracing::warn!("{}: Git from {}: {e:#}", folder.id, short(&peer));
                     folder.set_waiting(&peer, Some(format!("Git: {e:#}")));
-                    return Ok(Ended::HeldBack);
+                    held = true;
+                    continue;
+                }
+                if held && folder.accepts(peer_head.as_ref()) {
+                    return Ok(());
                 }
             }
-            PullMessage::Batch { entries, upto, head } => {
-                if !entries.is_empty() && !folder.accepts(head.as_ref()) {
+            PullMessage::Batch {
+                entries,
+                upto,
+                head,
+            } => {
+                peer_head = head;
+                if held {
+                    continue;
+                }
+                if !entries.is_empty() && !folder.accepts(peer_head.as_ref()) {
                     let why = format!(
                         "its checkout is at {}, this one at {}",
-                        describe(head.as_ref()),
+                        describe(peer_head.as_ref()),
                         describe(folder.head_commit().as_ref())
                     );
                     folder.set_waiting(&peer, Some(why));
-                    return Ok(Ended::HeldBack);
+                    held = true;
+                    continue;
                 }
 
                 cursor.seq = upto;
@@ -103,6 +126,9 @@ async fn once(node: &Node, folder: &Arc<Folder>, peer: DeviceId) -> Result<Ended
     }
 }
 
-fn describe(commit: Option<&crate::git::Oid>) -> String {
-    commit.map_or_else(|| "no commit".to_owned(), |oid| oid.as_str()[..12].to_owned())
+fn describe(commit: Option<&Oid>) -> String {
+    commit.map_or_else(
+        || "no commit".to_owned(),
+        |oid| oid.as_str()[..12].to_owned(),
+    )
 }

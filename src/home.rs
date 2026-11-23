@@ -37,7 +37,8 @@ impl Home {
     }
 
     pub fn create(&self) -> Result<()> {
-        fs::create_dir_all(self.dir.join("folders")).with_context(|| format!("making {}", self.dir.display()))
+        fs::create_dir_all(self.dir.join("folders"))
+            .with_context(|| format!("making {}", self.dir.display()))
     }
 
     pub fn key(&self) -> PathBuf {
@@ -50,6 +51,11 @@ impl Home {
 
     pub fn config(&self) -> PathBuf {
         self.dir.join("config.json")
+    }
+
+    /// The UDP port of the last run.
+    pub fn port(&self) -> PathBuf {
+        self.dir.join("port")
     }
 
     pub fn addrs(&self) -> PathBuf {

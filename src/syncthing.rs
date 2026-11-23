@@ -16,7 +16,10 @@ pub fn managing(path: &Path) -> Option<String> {
         .into_iter()
         .filter(|folder| !folder.paused)
         .find(|folder| {
-            let theirs = folder.path.canonicalize().unwrap_or_else(|_| folder.path.clone());
+            let theirs = folder
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| folder.path.clone());
             path.starts_with(&theirs) || theirs.starts_with(&path)
         })
         .map(|folder| {

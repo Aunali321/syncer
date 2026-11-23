@@ -9,7 +9,9 @@ use crate::{
     net::{
         node::{self, NetOptions, Node},
         pair::{Invites, Ticket},
-        proto::{ALPN, Chunk, GetReply, Hello, PAIR_ALPN, PairReply, PairRequest, PullMessage, Request},
+        proto::{
+            ALPN, Chunk, GetReply, Hello, PAIR_ALPN, PairReply, PairRequest, PullMessage, Request,
+        },
         wire,
     },
     report::{self, Report},
@@ -27,10 +29,7 @@ use std::{
     sync::{Arc, Mutex, Weak},
     time::Duration,
 };
-use tokio::{
-    sync::watch,
-    time::timeout,
-};
+use tokio::{sync::watch, time::timeout};
 use tokio_util::task::AbortOnDropHandle;
 
 /// How often members exchange cluster state when nothing changed.
@@ -74,8 +73,10 @@ impl Service {
             Some(_) => bail!("{} belongs to another key", home.cluster().display()),
             None => Cluster::new(me, &hostname()),
         };
-        let config = home.read_json::<LocalConfig>(&home.config())?.unwrap_or_default();
-        let endpoint = node::bind(key, options).await?;
+        let config = home
+            .read_json::<LocalConfig>(&home.config())?
+            .unwrap_or_default();
+        let endpoint = node::bind(key, options, &home.port()).await?;
         let node = Arc::new(Node::new(endpoint.clone(), home.addrs()));
 
         let service = Arc::new(Self {
@@ -112,7 +113,9 @@ impl Service {
     /// Stops every folder, saving its state, and closes the endpoint.
     pub async fn shutdown(&self) {
         lock(&self.tasks).clear();
-        let running: Vec<Running> = std::mem::take(&mut *lock(&self.folders)).into_values().collect();
+        let running: Vec<Running> = std::mem::take(&mut *lock(&self.folders))
+            .into_values()
+            .collect();
 
         for running in running {
             let Running { folder, _task, .. } = running;
@@ -153,7 +156,9 @@ impl Service {
     }
 
     pub fn folder(&self, id: &FolderId) -> Option<Arc<Folder>> {
-        lock(&self.folders).get(id).map(|running| running.folder.clone())
+        lock(&self.folders)
+            .get(id)
+            .map(|running| running.folder.clone())
     }
 
     pub fn failed(&self) -> BTreeMap<FolderId, String> {
@@ -174,7 +179,8 @@ impl Service {
     pub fn change_cluster(&self, change: impl FnOnce(&mut Cluster)) -> Result<()> {
         change(&mut lock(&self.cluster));
         self.save_cluster()?;
-        self.cluster_changes.send_modify(|generation| *generation += 1);
+        self.cluster_changes
+            .send_modify(|generation| *generation += 1);
         Ok(())
     }
 
@@ -182,7 +188,8 @@ impl Service {
     pub fn change_config(&self, change: impl FnOnce(&mut LocalConfig)) -> Result<()> {
         change(&mut lock(&self.config));
         self.save_config()?;
-        self.config_changes.send_modify(|generation| *generation += 1);
+        self.config_changes
+            .send_modify(|generation| *generation += 1);
         Ok(())
     }
 
@@ -203,7 +210,8 @@ impl Service {
         }
         if changed {
             self.save_cluster()?;
-            self.cluster_changes.send_modify(|generation| *generation += 1);
+            self.cluster_changes
+                .send_modify(|generation| *generation += 1);
             let removed: Vec<DeviceId> = {
                 let cluster = lock(&self.cluster);
                 cluster
@@ -256,11 +264,17 @@ impl Service {
     /// Joins the cluster a ticket invites into.
     pub async fn join(&self, ticket: &str) -> Result<String> {
         let ticket = Ticket::decode(ticket)?;
-        ensure!(ticket.addr.id != self.me(), "that invite is from this device");
-        let connection = timeout(node::CONNECT_TIMEOUT, self.node.endpoint().connect(ticket.addr.clone(), PAIR_ALPN))
-            .await
-            .context("timed out reaching the inviting device")?
-            .context("reaching the inviting device")?;
+        ensure!(
+            ticket.addr.id != self.me(),
+            "that invite is from this device"
+        );
+        let connection = timeout(
+            node::CONNECT_TIMEOUT,
+            self.node.endpoint().connect(ticket.addr.clone(), PAIR_ALPN),
+        )
+        .await
+        .context("timed out reaching the inviting device")?
+        .context("reaching the inviting device")?;
         let (mut send, mut recv) = connection.open_bi().await?;
         let request = PairRequest {
             secret: ticket.secret,
@@ -282,17 +296,26 @@ impl Service {
             self.node.learn(addr);
         }
         self.save_cluster()?;
-        self.cluster_changes.send_modify(|generation| *generation += 1);
+        self.cluster_changes
+            .send_modify(|generation| *generation += 1);
         Ok(lock(&self.cluster).name_of(&inviter))
     }
 
     /// Shares the directory at `path` as a new folder.
-    pub fn add_folder(&self, path: &Path, label: Option<String>, settings: Settings) -> Result<FolderId> {
+    pub fn add_folder(
+        &self,
+        path: &Path,
+        label: Option<String>,
+        settings: Settings,
+    ) -> Result<FolderId> {
         let path = absolute(path)?;
         ensure!(path.is_dir(), "{} is not a directory", path.display());
         self.check_free(&path)?;
         let label = label
-            .or_else(|| path.file_name().map(|name| name.to_string_lossy().into_owned()))
+            .or_else(|| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
             .unwrap_or_else(|| "folder".to_owned());
         let id = FolderId::random();
 
@@ -301,7 +324,13 @@ impl Service {
             cluster.set_holding(&id, true);
         })?;
         self.change_config(|config| {
-            config.folders.insert(id.clone(), LocalFolder { path, paused: false });
+            config.folders.insert(
+                id.clone(),
+                LocalFolder {
+                    path,
+                    paused: false,
+                },
+            );
         })?;
         Ok(id)
     }
@@ -309,15 +338,27 @@ impl Service {
     /// Takes a folder another device offers, into `path`.
     pub fn accept_folder(&self, id: &FolderId, path: &Path) -> Result<()> {
         let path = absolute(path)?;
-        ensure!(lock(&self.cluster).folder(id).is_some(), "no folder {id} is offered");
-        ensure!(!lock(&self.config).folders.contains_key(id), "this device already holds {id}");
+        ensure!(
+            lock(&self.cluster).folder(id).is_some(),
+            "no folder {id} is offered"
+        );
+        ensure!(
+            !lock(&self.config).folders.contains_key(id),
+            "this device already holds {id}"
+        );
         if path.exists() {
             ensure!(path.is_dir(), "{} is not a directory", path.display());
         }
         self.check_free(&path)?;
 
         self.change_config(|config| {
-            config.folders.insert(id.clone(), LocalFolder { path, paused: false });
+            config.folders.insert(
+                id.clone(),
+                LocalFolder {
+                    path,
+                    paused: false,
+                },
+            );
         })?;
         self.change_cluster(|cluster| cluster.set_holding(id, true))
     }
@@ -345,7 +386,9 @@ impl Service {
             config.folders.remove(id);
         })?;
         lock(&self.failed).remove(id);
-        let label = lock(&self.cluster).folder(id).map(|folder| (folder.label.clone(), folder.settings));
+        let label = lock(&self.cluster)
+            .folder(id)
+            .map(|folder| (folder.label.clone(), folder.settings));
         self.change_cluster(|cluster| {
             cluster.set_holding(id, false);
             if everywhere && let Some((label, settings)) = label {
@@ -357,7 +400,10 @@ impl Service {
     }
 
     pub fn pause(&self, id: &FolderId, paused: bool) -> Result<()> {
-        ensure!(lock(&self.config).folders.contains_key(id), "this device does not hold {id}");
+        ensure!(
+            lock(&self.config).folders.contains_key(id),
+            "this device does not hold {id}"
+        );
         self.change_config(|config| {
             if let Some(folder) = config.folders.get_mut(id) {
                 folder.paused = paused;
@@ -376,18 +422,24 @@ impl Service {
         lock(&self.folders).remove(id);
         Folder::reset(&path, id, &self.home.folder_state(id))?;
         lock(&self.failed).remove(id);
-        self.config_changes.send_modify(|generation| *generation += 1);
+        self.config_changes
+            .send_modify(|generation| *generation += 1);
         Ok(())
     }
 
     pub async fn rescan(&self, id: &FolderId) -> Result<()> {
-        let folder = self.folder(id).with_context(|| format!("{id} is not running here"))?;
+        let folder = self
+            .folder(id)
+            .with_context(|| format!("{id} is not running here"))?;
         folder.scan(crate::folder::scan::Scope::All).await?;
         Ok(())
     }
 
     pub fn forget_device(&self, device: &DeviceId) -> Result<()> {
-        ensure!(*device != self.me(), "this is this device; remove it from another one");
+        ensure!(
+            *device != self.me(),
+            "this is this device; remove it from another one"
+        );
         let name = lock(&self.cluster).name_of(device);
         self.change_cluster(|cluster| cluster.set_device(*device, &name, true))?;
         self.node.drop_peer(device);
@@ -419,14 +471,16 @@ impl Service {
             .folders
             .iter()
             .filter(|(_, local)| active && !local.paused)
-            .filter_map(|(id, local)| Some((id.clone(), (local.clone(), cluster.folder(id)?.settings))))
+            .filter_map(|(id, local)| {
+                Some((id.clone(), (local.clone(), cluster.folder(id)?.settings)))
+            })
             .collect();
 
         let stopped: Vec<Running> = lock(&self.folders)
             .extract_if(.., |id, running| {
-                wanted
-                    .get(id)
-                    .is_none_or(|(local, settings)| local.path != running.path || *settings != running.settings)
+                wanted.get(id).is_none_or(|(local, settings)| {
+                    local.path != running.path || *settings != running.settings
+                })
             })
             .map(|(_, running)| running)
             .collect();
@@ -458,11 +512,21 @@ impl Service {
                 continue;
             }
 
-            match Folder::open(id.clone(), &local.path, &self.home.folder_state(&id), *me.as_bytes(), settings) {
+            match Folder::open(
+                id.clone(),
+                &local.path,
+                &self.home.folder_state(&id),
+                *me.as_bytes(),
+                settings,
+            ) {
                 Ok(folder) => {
                     lock(&self.failed).remove(&id);
                     let peers = watch::Sender::new(cluster.holders(&id));
-                    let task = tokio::spawn(worker::run(self.node.clone(), folder.clone(), peers.subscribe()));
+                    let task = tokio::spawn(worker::run(
+                        self.node.clone(),
+                        folder.clone(),
+                        peers.subscribe(),
+                    ));
                     tracing::info!("{id}: syncing {}", local.path.display());
                     lock(&self.folders).insert(
                         id.clone(),
@@ -475,7 +539,8 @@ impl Service {
                         },
                     );
                     if !cluster.holds(&me, &id)
-                        && let Err(e) = self.change_cluster(|cluster| cluster.set_holding(&id, true))
+                        && let Err(e) =
+                            self.change_cluster(|cluster| cluster.set_holding(&id, true))
                     {
                         tracing::warn!("{id}: {e:#}");
                     }
@@ -502,8 +567,17 @@ impl Service {
             let config = lock(&self.config);
             cluster
                 .folders()
-                .filter(|(id, _)| !config.folders.contains_key(*id) && !cluster.holders(id).is_empty())
-                .filter(|(id, _)| !cluster.state().members.get(*id).and_then(|m| m.get(&cluster.me())).is_some_and(|r| !r.value))
+                .filter(|(id, _)| {
+                    !config.folders.contains_key(*id) && !cluster.holders(id).is_empty()
+                })
+                .filter(|(id, _)| {
+                    !cluster
+                        .state()
+                        .members
+                        .get(*id)
+                        .and_then(|m| m.get(&cluster.me()))
+                        .is_some_and(|r| !r.value)
+                })
                 .map(|(id, folder)| (id.clone(), folder.label.clone()))
                 .collect()
         };
@@ -523,14 +597,25 @@ impl Service {
 fn safe_name(label: &str, id: &FolderId) -> String {
     let name: String = label
         .chars()
-        .map(|c| if c.is_control() || "/\\:*?\"<>|".contains(c) { '_' } else { c })
+        .map(|c| {
+            if c.is_control() || "/\\:*?\"<>|".contains(c) {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect();
     let name = name.trim().trim_matches('.');
-    if name.is_empty() { id.to_string() } else { name.to_owned() }
+    if name.is_empty() {
+        id.to_string()
+    } else {
+        name.to_owned()
+    }
 }
 
 fn absolute(path: &Path) -> Result<PathBuf> {
-    let path = std::path::absolute(path).with_context(|| format!("resolving {}", path.display()))?;
+    let path =
+        std::path::absolute(path).with_context(|| format!("resolving {}", path.display()))?;
     Ok(match dunce_canonical(&path) {
         Some(real) => real,
         None => path,
@@ -544,7 +629,9 @@ fn dunce_canonical(path: &Path) -> Option<PathBuf> {
     #[cfg(windows)]
     {
         let text = real.to_str()?;
-        if let Some(rest) = text.strip_prefix(r"\\?\") && rest.as_bytes().get(1) == Some(&b':') {
+        if let Some(rest) = text.strip_prefix(r"\\?\")
+            && rest.as_bytes().get(1) == Some(&b':')
+        {
             return Some(PathBuf::from(rest));
         }
     }
@@ -558,7 +645,12 @@ async fn gossip(service: Weak<Service>) {
     };
 
     loop {
-        let Some(service) = service.upgrade() else { return };
+        let Some(service) = service.upgrade() else {
+            return;
+        };
+        // Marked seen before the state is read, so a change made while this
+        // round runs starts another.
+        changes.borrow_and_update();
         let peers = lock(&service.cluster).others();
         let exchanges = peers.into_iter().map(|peer| {
             let service = service.clone();
@@ -573,12 +665,13 @@ async fn gossip(service: Weak<Service>) {
         futures_join_all(exchanges).await;
         drop(service);
 
-        changes.borrow_and_update();
         let _ = timeout(GOSSIP, changes.changed()).await;
     }
 }
 
-async fn futures_join_all<F: Future<Output = ()> + Send + 'static>(futures: impl IntoIterator<Item = F>) {
+async fn futures_join_all<F: Future<Output = ()> + Send + 'static>(
+    futures: impl IntoIterator<Item = F>,
+) {
     let mut set = tokio::task::JoinSet::new();
     for future in futures {
         set.spawn(future);
@@ -588,12 +681,17 @@ async fn futures_join_all<F: Future<Output = ()> + Send + 'static>(futures: impl
 
 async fn manage_folders(service: Weak<Service>) {
     let (mut cluster, mut config) = match service.upgrade() {
-        Some(service) => (service.cluster_changes.subscribe(), service.config_changes.subscribe()),
+        Some(service) => (
+            service.cluster_changes.subscribe(),
+            service.config_changes.subscribe(),
+        ),
         None => return,
     };
 
     loop {
-        let Some(strong) = service.upgrade() else { return };
+        let Some(strong) = service.upgrade() else {
+            return;
+        };
         strong.reconcile();
         drop(strong);
 
@@ -622,7 +720,7 @@ impl ProtocolHandler for Members {
             return Ok(());
         }
 
-        service.node.adopt(&connection);
+        tracing::debug!("{} connected", short(&peer));
         drop(service);
 
         loop {
@@ -632,7 +730,9 @@ impl ProtocolHandler for Members {
             };
             let service = self.0.clone();
             tokio::spawn(async move {
-                let Some(service) = service.upgrade() else { return };
+                let Some(service) = service.upgrade() else {
+                    return;
+                };
                 if let Err(e) = serve_stream(service, peer, send, recv).await {
                     tracing::debug!("serving {}: {e:#}", short(&peer));
                 }
@@ -648,18 +748,23 @@ async fn serve_stream(
     mut recv: iroh::endpoint::RecvStream,
 ) -> Result<()> {
     let request: Request = wire::expect(&mut recv).await?;
+    tracing::trace!("{} asks: {request:?}", short(&peer));
 
     // Every request but the cluster's is about a folder the peer holds too.
     let folder = match &request {
         Request::Cluster(_) => None,
-        Request::Pull { folder, .. } | Request::Get { folder, .. } | Request::Pack { folder, .. } => {
+        Request::Pull { folder, .. }
+        | Request::Get { folder, .. }
+        | Request::Pack { folder, .. } => {
             let allowed = lock(&service.cluster).holds(&peer, folder);
             match service.folder(folder).filter(|_| allowed) {
                 Some(running) => Some(running),
                 None => {
                     let why = format!("{folder} is not shared with this device here");
                     match &request {
-                        Request::Pull { .. } => wire::send(&mut send, &PullMessage::Refused(why)).await?,
+                        Request::Pull { .. } => {
+                            wire::send(&mut send, &PullMessage::Refused(why)).await?
+                        }
                         Request::Get { .. } => wire::send(&mut send, &GetReply::Missing).await?,
                         _ => wire::send(&mut send, &Chunk::Failed(why)).await?,
                     }
@@ -681,8 +786,15 @@ async fn serve_stream(
             drop(service);
             serve::pull(folder, send, cursor).await
         }
-        (Request::Get { hash, path, offset, .. }, Some(folder)) => serve::get(folder, send, hash, path, offset).await,
-        (Request::Pack { wants, haves, .. }, Some(folder)) => serve::pack(folder, send, wants, haves).await,
+        (
+            Request::Get {
+                hash, path, offset, ..
+            },
+            Some(folder),
+        ) => serve::get(folder, send, hash, path, offset).await,
+        (Request::Pack { wants, haves, .. }, Some(folder)) => {
+            serve::pack(folder, send, wants, haves).await
+        }
         _ => Ok(()),
     }
 }
@@ -716,12 +828,23 @@ impl ProtocolHandler for Pairing {
     }
 }
 
-async fn pair(service: &Service, joiner: DeviceId, recv: &mut iroh::endpoint::RecvStream) -> Result<Hello> {
+async fn pair(
+    service: &Service,
+    joiner: DeviceId,
+    recv: &mut iroh::endpoint::RecvStream,
+) -> Result<Hello> {
     let request: PairRequest = wire::expect(recv).await?;
     service.invites.redeem(&request.secret)?;
-    ensure!(request.addr.id == joiner, "the joining device named another address");
+    ensure!(
+        request.addr.id == joiner,
+        "the joining device named another address"
+    );
     let name = request.name.trim();
-    let name = if name.is_empty() { short(&joiner) } else { name.to_owned() };
+    let name = if name.is_empty() {
+        short(&joiner)
+    } else {
+        name.to_owned()
+    };
 
     service.change_cluster(|cluster| cluster.set_device(joiner, &name, false))?;
     service.node.remember(request.addr);

@@ -129,7 +129,8 @@ pub fn hash_file(path: &Path) -> Result<Hash> {
 
 /// A symlink's target as bytes, the content syncer sends for it.
 pub fn link_bytes(path: &Path) -> Result<Vec<u8>> {
-    let target = fs::read_link(path).with_context(|| format!("reading the link {}", path.display()))?;
+    let target =
+        fs::read_link(path).with_context(|| format!("reading the link {}", path.display()))?;
     target
         .to_str()
         .map(|text| text.as_bytes().to_vec())
@@ -181,7 +182,13 @@ pub fn make_parents(root: &Path, path: &str) -> Result<()> {
 /// Moves the verified content at `temp` to `path`, with `meta`'s mode and
 /// mtime, when `path` still holds what `expected` says. Gives the stat of
 /// the placed file.
-pub fn place(root: &Path, path: &str, temp: &Path, meta: &FileMeta, expected: Option<&Stat>) -> Result<Stat> {
+pub fn place(
+    root: &Path,
+    path: &str,
+    temp: &Path,
+    meta: &FileMeta,
+    expected: Option<&Stat>,
+) -> Result<Stat> {
     let target = join(root, path);
     make_parents(root, path)?;
 
@@ -196,7 +203,10 @@ pub fn place(root: &Path, path: &str, temp: &Path, meta: &FileMeta, expected: Op
         bail!("{path} changed on disk; it is scanned again first");
     }
 
-    if let Some(Stat { kind: Kind::File, .. }) = expected {
+    if let Some(Stat {
+        kind: Kind::File, ..
+    }) = expected
+    {
         // Renaming over a file is atomic everywhere but needs the target to
         // be writable on Windows.
         clear_readonly(&target);

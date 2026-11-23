@@ -3,12 +3,7 @@
 //! DESIGN.md, "Local control".
 
 use crate::{
-    folder::Settings,
-    home::Home,
-    ids::FolderId,
-    net::wire,
-    report::Report,
-    service::Service,
+    folder::Settings, home::Home, ids::FolderId, net::wire, report::Report, service::Service,
     util::write_private,
 };
 use anyhow::{Context, Result, bail};
@@ -21,16 +16,41 @@ use tokio_util::task::AbortOnDropHandle;
 pub enum Command {
     Status,
     Invite,
-    Join { ticket: String },
-    Rename { name: String },
-    Forget { device: String },
-    Add { path: PathBuf, label: Option<String>, use_gitignore: bool },
-    Accept { folder: String, path: PathBuf },
-    AutoAccept { dir: Option<PathBuf> },
-    Remove { folder: String, everywhere: bool },
-    Pause { folder: String, paused: bool },
-    Rescan { folder: String },
-    Reset { folder: String },
+    Join {
+        ticket: String,
+    },
+    Rename {
+        name: String,
+    },
+    Forget {
+        device: String,
+    },
+    Add {
+        path: PathBuf,
+        label: Option<String>,
+        use_gitignore: bool,
+    },
+    Accept {
+        folder: String,
+        path: PathBuf,
+    },
+    AutoAccept {
+        dir: Option<PathBuf>,
+    },
+    Remove {
+        folder: String,
+        everywhere: bool,
+    },
+    Pause {
+        folder: String,
+        paused: bool,
+    },
+    Rescan {
+        folder: String,
+    },
+    Reset {
+        folder: String,
+    },
     Stop,
 }
 
@@ -53,19 +73,45 @@ struct Envelope {
     command: Command,
 }
 
+/// The control listener; dropping it stops listening and, if the address
+/// file is still this listener's, removes it.
+pub struct Listener {
+    _task: AbortOnDropHandle<()>,
+    file: PathBuf,
+    token: String,
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        let ours = std::fs::read(&self.file)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Address>(&bytes).ok())
+            .is_some_and(|address| address.token == self.token);
+        if ours {
+            let _ = std::fs::remove_file(&self.file);
+        }
+    }
+}
+
 /// Listens for commands until dropped. `stop` is told when a `Stop` arrives.
-pub async fn listen(service: Arc<Service>, stop: Arc<tokio::sync::Notify>) -> Result<AbortOnDropHandle<()>> {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).await.context("listening for commands")?;
+pub async fn listen(service: Arc<Service>, stop: Arc<tokio::sync::Notify>) -> Result<Listener> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .context("listening for commands")?;
     let token = hex::encode(rand::random::<[u8; 32]>());
     let address = Address {
         port: listener.local_addr()?.port(),
         token: token.clone(),
     };
-    write_private(&service.home().control(), &serde_json::to_vec(&address)?)?;
+    let file = service.home().control();
+    write_private(&file, &serde_json::to_vec(&address)?)?;
 
+    let listener_token = token.clone();
     let task = tokio::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else { continue };
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
             let (service, token, stop) = (service.clone(), token.clone(), stop.clone());
             tokio::spawn(async move {
                 if let Err(e) = answer(stream, &service, &token, &stop).await {
@@ -74,10 +120,19 @@ pub async fn listen(service: Arc<Service>, stop: Arc<tokio::sync::Notify>) -> Re
             });
         }
     });
-    Ok(AbortOnDropHandle::new(task))
+    Ok(Listener {
+        _task: AbortOnDropHandle::new(task),
+        file,
+        token: listener_token,
+    })
 }
 
-async fn answer(mut stream: TcpStream, service: &Arc<Service>, token: &str, stop: &tokio::sync::Notify) -> Result<()> {
+async fn answer(
+    mut stream: TcpStream,
+    service: &Arc<Service>,
+    token: &str,
+    stop: &tokio::sync::Notify,
+) -> Result<()> {
     let envelope: Envelope = wire::expect(&mut stream).await?;
     if envelope.token != token {
         bail!("a command with the wrong token");
@@ -98,10 +153,9 @@ async fn answer(mut stream: TcpStream, service: &Arc<Service>, token: &str, stop
 
 async fn run(service: &Arc<Service>, command: Command) -> Result<Reply> {
     let folder = |query: &str| -> Result<FolderId> {
-        service
-            .cluster()
-            .find_folder(query)
-            .with_context(|| format!("no folder is called {query:?} (use its id if two share a label)"))
+        service.cluster().find_folder(query).with_context(|| {
+            format!("no folder is called {query:?} (use its id if two share a label)")
+        })
     };
 
     Ok(match command {
@@ -109,7 +163,9 @@ async fn run(service: &Arc<Service>, command: Command) -> Result<Reply> {
         Command::Invite => Reply::Done(service.invite().await?),
         Command::Join { ticket } => {
             let inviter = service.join(&ticket).await?;
-            Reply::Done(format!("Joined {inviter}'s devices. Folders they share show up in `syncer status`."))
+            Reply::Done(format!(
+                "Joined {inviter}'s devices. Folders they share show up in `syncer status`."
+            ))
         }
         Command::Rename { name } => {
             service.rename(&name)?;
@@ -117,15 +173,27 @@ async fn run(service: &Arc<Service>, command: Command) -> Result<Reply> {
         }
         Command::Forget { device } => {
             let cluster = service.cluster();
-            let id = cluster.find_device(&device).with_context(|| format!("no device is called {device:?}"))?;
+            let id = cluster
+                .find_device(&device)
+                .with_context(|| format!("no device is called {device:?}"))?;
             service.forget_device(&id)?;
             Reply::Done(format!("{} is no longer trusted.", cluster.name_of(&id)))
         }
-        Command::Add { path, label, use_gitignore } => {
+        Command::Add {
+            path,
+            label,
+            use_gitignore,
+        } => {
             let id = service.add_folder(&path, label, Settings { use_gitignore })?;
-            Reply::Done(format!("Sharing {} as {id}. Other devices can accept it now.", path.display()))
+            Reply::Done(format!(
+                "Sharing {} as {id}. Other devices can accept it now.",
+                path.display()
+            ))
         }
-        Command::Accept { folder: query, path } => {
+        Command::Accept {
+            folder: query,
+            path,
+        } => {
             let id = folder(&query)?;
             service.accept_folder(&id, &path)?;
             Reply::Done(format!("Syncing {id} into {}.", path.display()))
@@ -136,13 +204,19 @@ async fn run(service: &Arc<Service>, command: Command) -> Result<Reply> {
                 None => None,
             };
             let message = match &dir {
-                Some(dir) => format!("Offered folders are accepted into {} from now on.", dir.display()),
+                Some(dir) => format!(
+                    "Offered folders are accepted into {} from now on.",
+                    dir.display()
+                ),
                 None => "Offered folders wait to be accepted.".to_owned(),
             };
             service.change_config(|config| config.auto_accept = dir)?;
             Reply::Done(message)
         }
-        Command::Remove { folder: query, everywhere } => {
+        Command::Remove {
+            folder: query,
+            everywhere,
+        } => {
             let id = folder(&query)?;
             service.remove_folder(&id, everywhere)?;
             Reply::Done(if everywhere {
@@ -151,10 +225,16 @@ async fn run(service: &Arc<Service>, command: Command) -> Result<Reply> {
                 format!("{id} no longer syncs here. Its files stay.")
             })
         }
-        Command::Pause { folder: query, paused } => {
+        Command::Pause {
+            folder: query,
+            paused,
+        } => {
             let id = folder(&query)?;
             service.pause(&id, paused)?;
-            Reply::Done(format!("{id} {}.", if paused { "is paused" } else { "syncs again" }))
+            Reply::Done(format!(
+                "{id} {}.",
+                if paused { "is paused" } else { "syncs again" }
+            ))
         }
         Command::Rescan { folder: query } => {
             let id = folder(&query)?;
@@ -164,7 +244,9 @@ async fn run(service: &Arc<Service>, command: Command) -> Result<Reply> {
         Command::Reset { folder: query } => {
             let id = folder(&query)?;
             service.reset(&id)?;
-            Reply::Done(format!("{id} starts over from a fresh scan. Nothing is deleted."))
+            Reply::Done(format!(
+                "{id} starts over from a fresh scan. Nothing is deleted."
+            ))
         }
         Command::Stop => Reply::Done("Stopping.".to_owned()),
     })

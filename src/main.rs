@@ -107,7 +107,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
     let home = Home::resolve(cli.home)?;
 
     let command = match cli.command {
-        Commands::Run { port, no_relays, no_mdns } => {
+        Commands::Run {
+            port,
+            no_relays,
+            no_mdns,
+        } => {
             serve(
                 home,
                 NetOptions {
@@ -136,7 +140,11 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Commands::Join { ticket } => Command::Join { ticket },
         Commands::Name { name } => Command::Rename { name },
         Commands::Forget { device } => Command::Forget { device },
-        Commands::Add { path, label, no_gitignore } => Command::Add {
+        Commands::Add {
+            path,
+            label,
+            no_gitignore,
+        } => Command::Add {
             path: std::path::absolute(path)?,
             label,
             use_gitignore: !no_gitignore,
@@ -146,11 +154,21 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             path: std::path::absolute(path)?,
         },
         Commands::AutoAccept { dir, off } => Command::AutoAccept {
-            dir: if off { None } else { dir.map(std::path::absolute).transpose()? },
+            dir: if off {
+                None
+            } else {
+                dir.map(std::path::absolute).transpose()?
+            },
         },
         Commands::Remove { folder, everywhere } => Command::Remove { folder, everywhere },
-        Commands::Pause { folder } => Command::Pause { folder, paused: true },
-        Commands::Resume { folder } => Command::Pause { folder, paused: false },
+        Commands::Pause { folder } => Command::Pause {
+            folder,
+            paused: true,
+        },
+        Commands::Resume { folder } => Command::Pause {
+            folder,
+            paused: false,
+        },
         Commands::Rescan { folder } => Command::Rescan { folder },
         Commands::Reset { folder } => Command::Reset { folder },
         Commands::Stop => Command::Stop,
@@ -187,7 +205,7 @@ async fn serve(home: Home, options: NetOptions) -> Result<()> {
 
     let service = Service::start(home, &options).await?;
     let stop = Arc::new(tokio::sync::Notify::new());
-    let _control = control::listen(service.clone(), stop.clone()).await?;
+    let control = control::listen(service.clone(), stop.clone()).await?;
     println!("syncer is running as {} ({})", service.name(), service.me());
 
     tokio::select! {
@@ -197,8 +215,8 @@ async fn serve(home: Home, options: NetOptions) -> Result<()> {
     }
 
     tracing::info!("stopping");
+    drop(control);
     service.shutdown().await;
-    let _ = std::fs::remove_file(service.home().control());
     Ok(())
 }
 

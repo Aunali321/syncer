@@ -159,7 +159,13 @@ impl Cluster {
             .members
             .entry(folder.clone())
             .or_default()
-            .insert(self.me, Lww { value: holds, stamp });
+            .insert(
+                self.me,
+                Lww {
+                    value: holds,
+                    stamp,
+                },
+            );
     }
 
     pub fn device(&self, id: &DeviceId) -> Option<&DeviceInfo> {
@@ -211,7 +217,9 @@ impl Cluster {
             .get(folder)
             .into_iter()
             .flatten()
-            .filter(|(device, record)| record.value && **device != self.me && self.is_member(device))
+            .filter(|(device, record)| {
+                record.value && **device != self.me && self.is_member(device)
+            })
             .map(|(device, _)| *device)
             .collect()
     }
@@ -274,7 +282,10 @@ mod tests {
         on_a.merge(on_b.state());
 
         assert_eq!(on_a.state(), on_b.state());
-        assert_eq!(on_a.folder(&folder).map(|f| f.label.as_str()), Some("renamed"));
+        assert_eq!(
+            on_a.folder(&folder).map(|f| f.label.as_str()),
+            Some("renamed")
+        );
         assert_eq!(on_b.holders(&folder), vec![a]);
         assert!(on_a.holders(&folder).is_empty());
     }
@@ -285,13 +296,18 @@ mod tests {
         let mut cluster = Cluster::new(a, "laptop");
         cluster.set_device(b, "desk", false);
         let folder = FolderId::random();
-        cluster.state.members.entry(folder.clone()).or_default().insert(
-            b,
-            Lww {
-                value: true,
-                stamp: Stamp { lamport: 1, by: b },
-            },
-        );
+        cluster
+            .state
+            .members
+            .entry(folder.clone())
+            .or_default()
+            .insert(
+                b,
+                Lww {
+                    value: true,
+                    stamp: Stamp { lamport: 1, by: b },
+                },
+            );
         assert_eq!(cluster.holders(&folder), vec![b]);
 
         cluster.set_device(b, "desk", true);

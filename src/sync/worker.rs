@@ -74,7 +74,11 @@ impl Due {
 pub async fn run(node: Arc<Node>, folder: Arc<Folder>, mut peers: watch::Receiver<Vec<DeviceId>>) {
     let (events_tx, mut events) = mpsc::unbounded_channel();
     let watcher = watch_folder(folder.root(), events_tx);
-    let full_every = if watcher.is_some() { FULL_SCAN } else { UNWATCHED_SCAN };
+    let full_every = if watcher.is_some() {
+        FULL_SCAN
+    } else {
+        UNWATCHED_SCAN
+    };
     let mut full_scan = interval(full_every);
     let mut retry = interval(RETRY);
     let mut save = interval(SAVE);
@@ -177,12 +181,21 @@ async fn apply(folder: &Arc<Folder>, queued: &mut Vec<(Hash, String)>) {
 }
 
 /// Starts a puller for every peer in `peers` and stops the others.
-fn follow(node: &Arc<Node>, folder: &Arc<Folder>, peers: &[DeviceId], pullers: &mut HashMap<DeviceId, AbortOnDropHandle<()>>) {
+fn follow(
+    node: &Arc<Node>,
+    folder: &Arc<Folder>,
+    peers: &[DeviceId],
+    pullers: &mut HashMap<DeviceId, AbortOnDropHandle<()>>,
+) {
     pullers.retain(|peer, _| peers.contains(peer));
 
     for peer in peers {
         pullers.entry(*peer).or_insert_with(|| {
-            AbortOnDropHandle::new(tokio::spawn(pull::follow(node.clone(), folder.clone(), *peer)))
+            AbortOnDropHandle::new(tokio::spawn(pull::follow(
+                node.clone(),
+                folder.clone(),
+                *peer,
+            )))
         });
     }
 }
@@ -201,7 +214,10 @@ fn far_future() -> Instant {
 /// Watches `root`, sending what changed. `None` when the folder cannot be
 /// watched (too many directories for the system's limit, say); it is then
 /// scanned on a timer.
-fn watch_folder(root: &Path, events: mpsc::UnboundedSender<Event>) -> Option<notify::RecommendedWatcher> {
+fn watch_folder(
+    root: &Path,
+    events: mpsc::UnboundedSender<Event>,
+) -> Option<notify::RecommendedWatcher> {
     let root_owned = root.canonicalize().unwrap_or_else(|_| root.to_owned());
     let handler = move |result: notify::Result<notify::Event>| {
         let event = match result {
@@ -233,7 +249,10 @@ fn watch_folder(root: &Path, events: mpsc::UnboundedSender<Event>) -> Option<not
     let mut watcher = match notify::recommended_watcher(handler) {
         Ok(watcher) => watcher,
         Err(e) => {
-            tracing::warn!("{}: not watched, scanning every minute instead: {e}", root.display());
+            tracing::warn!(
+                "{}: not watched, scanning every minute instead: {e}",
+                root.display()
+            );
             return None;
         }
     };
@@ -241,7 +260,10 @@ fn watch_folder(root: &Path, events: mpsc::UnboundedSender<Event>) -> Option<not
     match watcher.watch(root, RecursiveMode::Recursive) {
         Ok(()) => Some(watcher),
         Err(e) => {
-            tracing::warn!("{}: not watched, scanning every minute instead: {e}", root.display());
+            tracing::warn!(
+                "{}: not watched, scanning every minute instead: {e}",
+                root.display()
+            );
             None
         }
     }
@@ -267,7 +289,10 @@ fn classify(root: &Path, path: &Path) -> Option<Seen> {
     match parts.first().copied()? {
         OWN_DIR => None,
         ".git" => match parts.get(1).copied() {
-            Some("HEAD" | "refs" | "packed-refs" | "MERGE_HEAD" | "rebase-merge" | "rebase-apply" | "index.lock") => Some(Seen::Git),
+            Some(
+                "HEAD" | "refs" | "packed-refs" | "MERGE_HEAD" | "rebase-merge" | "rebase-apply"
+                | "index.lock",
+            ) => Some(Seen::Git),
             _ => None,
         },
         _ => Some(Seen::File(parts.join("/"))),
@@ -281,8 +306,13 @@ mod tests {
     #[test]
     fn events_are_sorted_by_what_they_touch() {
         let root = Path::new("/w");
-        assert!(matches!(classify(root, Path::new("/w/src/a.rs")), Some(Seen::File(path)) if path == "src/a.rs"));
-        assert!(matches!(classify(root, Path::new("/w/.git/refs/heads/main")), Some(Seen::Git)));
+        assert!(
+            matches!(classify(root, Path::new("/w/src/a.rs")), Some(Seen::File(path)) if path == "src/a.rs")
+        );
+        assert!(matches!(
+            classify(root, Path::new("/w/.git/refs/heads/main")),
+            Some(Seen::Git)
+        ));
         assert!(classify(root, Path::new("/w/.git/objects/ab/cd")).is_none());
         assert!(classify(root, Path::new("/w/.syncer/tmp/x")).is_none());
         assert!(classify(root, Path::new("/elsewhere")).is_none());
