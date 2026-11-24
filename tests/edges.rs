@@ -16,20 +16,23 @@ fn odd_names_links_and_modes_survive_the_trip() {
     let (_root, devices) = cluster(2);
     share(&devices, &[]);
     let a = &devices[0];
-    let names = [
+    let long = "long".repeat(60);
+    let mut names = vec![
         "spaces in name.txt",
         "ünïcödé/ファイル.txt",
         "emoji 🦀.rs",
         "decomposed-e\u{301}.txt",
         "composed-\u{e9}.txt",
         "-leading-dash",
-        "#hash;semi'quote\"",
-        "trailing.dot.",
         "deep/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t/u/v/w/x/y/z/file",
-        &"long".repeat(60),
+        long.as_str(),
         "empty",
     ];
-    for name in names {
+    // Windows takes neither a quote in a name nor a dot at its end.
+    if cfg!(unix) {
+        names.extend(["#hash;semi'quote\"", "trailing.dot."]);
+    }
+    for &name in &names {
         let content = if name == "empty" {
             String::new()
         } else {
@@ -54,7 +57,7 @@ fn odd_names_links_and_modes_survive_the_trip() {
     }
 
     let merged = converge(&devices.iter().collect::<Vec<_>>(), Duration::from_secs(60));
-    for name in names {
+    for &name in &names {
         assert!(merged.contains_key(name), "{name} did not arrive");
     }
     #[cfg(unix)]
@@ -175,6 +178,7 @@ fn a_forgotten_device_gets_nothing_more() {
 }
 
 #[test]
+#[cfg_attr(windows, ignore = "Windows cannot make these names")]
 fn names_that_cannot_sync_stay_where_they_are_and_say_so() {
     let (_root, devices) = cluster(2);
     share(&devices, &[]);
