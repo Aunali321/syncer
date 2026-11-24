@@ -100,10 +100,17 @@ pub fn converge(devices: &[&Device], patience: Duration) -> BTreeMap<String, Nod
                 ));
             }
             for device in devices {
+                let log = device.log_text();
+                let warnings: Vec<&str> = log
+                    .lines()
+                    .filter(|line| line.contains("WARN") || line.contains("ERROR"))
+                    .collect();
                 report.push_str(&format!(
-                    "\n--- {} status:\n{}",
+                    "\n--- {} status:\n{}--- {} warnings:\n{}",
                     device.name,
-                    device.status()
+                    device.status(),
+                    device.name,
+                    warnings[warnings.len().saturating_sub(15)..].join("\n")
                 ));
             }
             panic!("the devices did not converge:{report}");
