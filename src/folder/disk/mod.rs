@@ -8,7 +8,7 @@ mod write;
 
 pub use content::{copy_verified, is_hole, write_symlink};
 pub use folding::Folding;
-pub use write::{make_parents, place, remove, time_of};
+pub use write::{make_parents, place, remove};
 
 use crate::folder::index::{FileMeta, Hash, Kind};
 use anyhow::{Context, Result, bail};

@@ -50,7 +50,11 @@ pub fn place(
     if meta.kind == Kind::File {
         let file = File::options().write(true).open(temp)?;
         set_executable(&file, meta.executable)?;
-        file.set_modified(time_of(meta.mtime_ms))?;
+        // A time this platform cannot hold (from a peer whose clock or file
+        // says so) leaves the file's own.
+        if let Some(time) = time_of(meta.mtime_ms) {
+            file.set_modified(time)?;
+        }
         file.sync_all()?;
     }
 
@@ -122,12 +126,14 @@ pub fn remove(root: &Path, path: &str, expected: &Stat) -> Result<()> {
     Ok(())
 }
 
-pub fn time_of(mtime_ms: i64) -> SystemTime {
+/// The time `mtime_ms` milliseconds from the Unix epoch, if this platform
+/// can represent it.
+fn time_of(mtime_ms: i64) -> Option<SystemTime> {
     let magnitude = Duration::from_millis(mtime_ms.unsigned_abs());
     if mtime_ms >= 0 {
-        UNIX_EPOCH + magnitude
+        UNIX_EPOCH.checked_add(magnitude)
     } else {
-        UNIX_EPOCH - magnitude
+        UNIX_EPOCH.checked_sub(magnitude)
     }
 }
 
