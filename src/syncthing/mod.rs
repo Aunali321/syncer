@@ -14,16 +14,14 @@ pub fn managing(path: &Path) -> Option<String> {
     let config = config_file()?;
     let text = std::fs::read_to_string(&config).ok()?;
     let folders = parse(&text);
-    let path = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+    let path = crate::util::canonical(path).unwrap_or_else(|| path.to_owned());
 
     folders
         .into_iter()
         .filter(|folder| !folder.paused)
         .find_map(|folder| {
-            let theirs = folder
-                .path
-                .canonicalize()
-                .unwrap_or_else(|_| folder.path.clone());
+            let theirs =
+                crate::util::canonical(&folder.path).unwrap_or_else(|| folder.path.clone());
             if theirs.starts_with(&path) {
                 return Some(format!(
                     "Syncthing syncs {} inside this. Pause it in Syncthing first.",

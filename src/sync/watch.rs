@@ -19,7 +19,7 @@ pub fn watch_folder(
     root: &Path,
     events: mpsc::UnboundedSender<Event>,
 ) -> Option<notify::RecommendedWatcher> {
-    let root_owned = root.canonicalize().unwrap_or_else(|_| root.to_owned());
+    let root_owned = crate::util::canonical(root).unwrap_or_else(|| root.to_owned());
     let handler = move |result: notify::Result<notify::Event>| {
         let event = match result {
             Ok(event) if event.need_rescan() => Event::Everything,

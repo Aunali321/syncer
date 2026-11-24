@@ -243,24 +243,8 @@ pub(super) fn safe_name(label: &str, id: &FolderId) -> String {
 fn absolute(path: &Path) -> Result<PathBuf> {
     let path =
         std::path::absolute(path).with_context(|| format!("resolving {}", path.display()))?;
-    Ok(match dunce_canonical(&path) {
+    Ok(match crate::util::canonical(&path) {
         Some(real) => real,
         None => path,
     })
-}
-
-/// The canonical form of `path` when it exists, without Windows' verbatim
-/// prefix.
-fn dunce_canonical(path: &Path) -> Option<PathBuf> {
-    let real = path.canonicalize().ok()?;
-    #[cfg(windows)]
-    {
-        let text = real.to_str()?;
-        if let Some(rest) = text.strip_prefix(r"\\?\")
-            && rest.as_bytes().get(1) == Some(&b':')
-        {
-            return Some(PathBuf::from(rest));
-        }
-    }
-    Some(real)
 }

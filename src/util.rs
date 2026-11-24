@@ -51,6 +51,22 @@ fn write_through_temp(path: &Path, bytes: &[u8], mut options: fs::OpenOptions) -
     written.with_context(|| format!("writing {}", path.display()))
 }
 
+/// The canonical form of `path` when it exists, without the verbatim prefix
+/// (`\\?\C:\...`) Windows gives it, which no other path compares equal to.
+pub fn canonical(path: &Path) -> Option<PathBuf> {
+    let real = path.canonicalize().ok()?;
+    #[cfg(windows)]
+    {
+        let text = real.to_str()?;
+        if let Some(rest) = text.strip_prefix(r"\\?\")
+            && rest.as_bytes().get(1) == Some(&b':')
+        {
+            return Some(PathBuf::from(rest));
+        }
+    }
+    Some(real)
+}
+
 /// An error and its causes for people, each said once: some errors already
 /// include their cause in their own message.
 pub fn describe(error: &anyhow::Error) -> String {
