@@ -8,15 +8,16 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use iroh::{
-    Endpoint, EndpointAddr, SecretKey,
+    Endpoint, EndpointAddr, RelayMode, RelayUrl, SecretKey,
     endpoint::{Connection, IdleTimeout, QuicTransportConfig, VarInt, presets},
 };
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Mutex,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 use tokio::time::timeout;
 
@@ -28,15 +29,26 @@ const IDLE_MS: u32 = 45_000;
 /// How long a connection may take to open.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Which relays carry traffic between devices that cannot reach each other
+/// directly.
+#[derive(Debug, Clone, Default)]
+pub enum Relays {
+    /// iroh's public relays, with its DNS address lookup.
+    #[default]
+    Public,
+    /// These relays (run with `iroh-relay`), with iroh's DNS address lookup.
+    Own(Vec<RelayUrl>),
+    /// None, and no DNS lookup: only direct addresses and the local network.
+    Off,
+}
+
 /// How the endpoint finds and reaches peers.
 #[derive(Debug, Clone)]
 pub struct NetOptions {
     /// UDP port to bind; 0 reuses the port of the last run, so peers that
     /// remember this device's address still reach it, or picks one.
     pub port: u16,
-    /// Public relays and DNS address lookup (iroh's n0 services). Off, only
-    /// direct addresses and the local network work.
-    pub relays: bool,
+    pub relays: Relays,
     /// Finding peers on the local network.
     pub mdns: bool,
 }
@@ -45,10 +57,18 @@ impl Default for NetOptions {
     fn default() -> Self {
         Self {
             port: 0,
-            relays: true,
+            relays: Relays::Public,
             mdns: true,
         }
     }
+}
+
+/// How an open connection reaches a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Link {
+    Direct,
+    /// Through a relay: slower, and public relays limit how much they carry.
+    Relayed,
 }
 
 /// Binds the endpoint. With no port asked for, the port of the last run
@@ -93,10 +113,12 @@ async fn bind_on(secret: SecretKey, options: &NetOptions, port: u16) -> Result<E
         .keep_alive_interval(KEEP_ALIVE)
         .max_idle_timeout(Some(IdleTimeout::from(VarInt::from_u32(IDLE_MS))))
         .build();
-    let mut builder = if options.relays {
-        Endpoint::builder(presets::N0)
-    } else {
-        Endpoint::builder(presets::Minimal)
+    let mut builder = match &options.relays {
+        Relays::Public => Endpoint::builder(presets::N0),
+        Relays::Own(urls) => {
+            Endpoint::builder(presets::N0).relay_mode(RelayMode::custom(urls.iter().cloned()))
+        }
+        Relays::Off => Endpoint::builder(presets::Minimal),
     }
     .secret_key(secret)
     .transport_config(transport);
@@ -127,10 +149,13 @@ pub struct Node {
     connections: Mutex<HashMap<DeviceId, Connection>>,
     addrs: Mutex<HashMap<DeviceId, EndpointAddr>>,
     addrs_file: PathBuf,
+    /// When each peer was last heard from, kept across restarts.
+    seen: Mutex<BTreeMap<DeviceId, SystemTime>>,
+    seen_file: PathBuf,
 }
 
 impl Node {
-    pub fn new(endpoint: Endpoint, addrs_file: PathBuf) -> Self {
+    pub fn new(endpoint: Endpoint, addrs_file: PathBuf, seen_file: PathBuf) -> Self {
         let addrs = std::fs::read(&addrs_file)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Vec<EndpointAddr>>(&bytes).ok())
@@ -139,12 +164,39 @@ impl Node {
             .map(|addr| (addr.id, addr))
             .collect();
 
+        let seen = std::fs::read(&seen_file)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+
         Self {
             endpoint,
             connections: Mutex::default(),
             addrs: Mutex::new(addrs),
             addrs_file,
+            seen: Mutex::new(seen),
+            seen_file,
         }
+    }
+
+    /// Notes that `peer` was heard from just now.
+    pub fn saw(&self, peer: &DeviceId) {
+        let seen = {
+            let mut seen = lock(&self.seen);
+            seen.insert(*peer, SystemTime::now());
+            seen.clone()
+        };
+        if let Err(e) = serde_json::to_vec_pretty(&seen)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| write_atomic(&self.seen_file, &bytes))
+        {
+            tracing::warn!("saving when peers were seen: {e:#}");
+        }
+    }
+
+    /// When `peer` was last heard from, if ever.
+    pub fn last_seen(&self, peer: &DeviceId) -> Option<SystemTime> {
+        lock(&self.seen).get(peer).copied()
     }
 
     pub fn endpoint(&self) -> &Endpoint {
@@ -212,6 +264,7 @@ impl Node {
             .context("connecting")?;
         tracing::debug!("connected to {}", crate::ids::short(&peer));
         lock(&self.connections).insert(peer, connection.clone());
+        self.saw(&peer);
         Ok(connection)
     }
 
@@ -223,8 +276,20 @@ impl Node {
     }
 
     pub fn is_connected(&self, peer: &DeviceId) -> bool {
-        lock(&self.connections)
+        self.link(peer).is_some()
+    }
+
+    /// How the open connection to `peer` reaches it, if one is open.
+    pub fn link(&self, peer: &DeviceId) -> Option<Link> {
+        let connections = lock(&self.connections);
+        let connection = connections
             .get(peer)
-            .is_some_and(|connection| connection.close_reason().is_none())
+            .filter(|connection| connection.close_reason().is_none())?;
+        let relayed = connection
+            .paths()
+            .iter()
+            .find(|path| path.is_selected())
+            .is_some_and(|path| path.is_relay());
+        Some(if relayed { Link::Relayed } else { Link::Direct })
     }
 }

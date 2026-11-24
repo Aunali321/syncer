@@ -173,7 +173,7 @@ pub async fn pack(
     let (command, input) = match prepared {
         Ok(prepared) => prepared,
         Err(e) => {
-            wire::send(&mut send, &Chunk::Failed(format!("{e:#}"))).await?;
+            wire::send(&mut send, &Chunk::Failed(crate::util::describe(&e))).await?;
             return Ok(());
         }
     };

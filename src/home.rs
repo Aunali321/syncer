@@ -4,12 +4,12 @@ use crate::{
     ids::FolderId,
     util::{write_atomic, write_private},
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use iroh::SecretKey;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    fs,
+    fs::{self, File, TryLockError},
     io::ErrorKind,
     path::{Path, PathBuf},
 };
@@ -41,6 +41,26 @@ impl Home {
             .with_context(|| format!("making {}", self.dir.display()))
     }
 
+    /// Claims this home for one running service until the returned file is
+    /// dropped. Two services on one home would share a key and overwrite each
+    /// other's state.
+    pub fn claim(&self) -> Result<File> {
+        let path = self.dir.join("lock");
+        let file = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(file),
+            Err(TryLockError::WouldBlock) => bail!("syncer is already running."),
+            Err(TryLockError::Error(e)) => {
+                Err(e).with_context(|| format!("locking {}", path.display()))
+            }
+        }
+    }
+
     pub fn key(&self) -> PathBuf {
         self.dir.join("key")
     }
@@ -60,6 +80,11 @@ impl Home {
 
     pub fn addrs(&self) -> PathBuf {
         self.dir.join("addresses.json")
+    }
+
+    /// When each peer was last heard from.
+    pub fn seen(&self) -> PathBuf {
+        self.dir.join("seen.json")
     }
 
     /// Where the running service says how to reach it.
@@ -112,8 +137,21 @@ impl Home {
 pub struct LocalConfig {
     /// The folders this device holds, by id.
     pub folders: BTreeMap<FolderId, LocalFolder>,
-    /// Where offered folders are accepted without asking, if anywhere.
-    pub auto_accept: Option<PathBuf>,
+    /// Whether and where offered folders are accepted without asking.
+    #[serde(default)]
+    pub accept_new: AcceptNew,
+}
+
+/// What happens to a folder another device starts sharing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AcceptNew {
+    /// It waits for `syncer accept`.
+    #[default]
+    Ask,
+    /// It goes where it is on the device that shared it.
+    SamePlace,
+    /// It goes into this directory, named by its label.
+    Into(PathBuf),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -4,4 +4,5 @@
 pub mod fetch;
 pub mod pull;
 pub mod serve;
+mod watch;
 pub mod worker;

@@ -4,6 +4,7 @@
 
 use crate::folder::{
     disk::{self, Stat},
+    index::path_problem,
     rules::Rules,
 };
 use std::{collections::BTreeMap, fs, io::ErrorKind, path::Path};
@@ -16,6 +17,9 @@ pub struct Walked {
     /// Paths that could not be read, with why. Nothing under them counts as
     /// deleted.
     pub unreadable: BTreeMap<String, String>,
+    /// Paths whose names cannot sync, with why; a directory's contents with
+    /// it.
+    pub refused: BTreeMap<String, String>,
 }
 
 /// What part of a folder to walk.
@@ -52,6 +56,10 @@ pub fn walk(root: &Path, rules: &Rules, scope: &Scope) -> Walked {
         Scope::Paths(paths) => {
             for path in paths {
                 if rules.excluded(path, false) {
+                    continue;
+                }
+                if let Some(why) = path_problem(path) {
+                    walked.refused.insert(path.clone(), why.to_owned());
                     continue;
                 }
 
@@ -102,15 +110,20 @@ fn walk_dir(root: &Path, dir: &str, rules: &Rules, walked: &mut Walked) {
                 continue;
             }
         };
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            tracing::warn!("skipping a name that is not UTF-8 in {}", full.display());
-            continue;
+        let file_name = entry.file_name();
+        let (name, utf8) = match file_name.to_str() {
+            Some(name) => (name.to_owned(), true),
+            None => (file_name.to_string_lossy().into_owned(), false),
         };
         let path = if dir.is_empty() {
             name
         } else {
             format!("{dir}/{name}")
         };
+        if !utf8 {
+            walked.refused.insert(path, "invalid UTF-8 name".to_owned());
+            continue;
+        }
         let meta = match entry.path().symlink_metadata() {
             Ok(meta) => meta,
             Err(e) if e.kind() == ErrorKind::NotFound => continue,
@@ -122,6 +135,10 @@ fn walk_dir(root: &Path, dir: &str, rules: &Rules, walked: &mut Walked) {
         let is_dir = meta.is_dir();
 
         if rules.excluded(&path, is_dir) {
+            continue;
+        }
+        if let Some(why) = path_problem(&path) {
+            walked.refused.insert(path, why.to_owned());
             continue;
         }
 
@@ -151,7 +168,7 @@ mod tests {
         fs::write(root.join(".git/HEAD"), "ref").expect("write");
         fs::write(root.join(".syncer/folder"), "id").expect("write");
 
-        let rules = Rules::new(root, true);
+        let rules = Rules::new(root, true, Default::default());
         let walked = walk(root, &rules, &Scope::All);
         let paths: Vec<_> = walked.files.keys().map(String::as_str).collect();
 
@@ -166,7 +183,7 @@ mod tests {
         fs::write(root.join("a/b/c"), "c").expect("write");
         fs::write(root.join("x"), "x").expect("write");
 
-        let rules = Rules::new(root, true);
+        let rules = Rules::new(root, true, Default::default());
         let scope = Scope::Paths(vec!["a".into(), "gone".into()]);
         let walked = walk(root, &rules, &scope);
 

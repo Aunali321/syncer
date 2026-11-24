@@ -40,7 +40,9 @@ fn three_devices_share_a_git_project() {
     a.write("src/main.rs", "fn main() {}\n");
     a.write(".gitignore", "target/\n");
     a.write("target/build.out", "big binary\n");
+    a.write("target/pinned.txt", "tracked though ignored\n");
     a.git(&["add", "-A"]);
+    a.git(&["add", "-f", "target/pinned.txt"]);
     a.git(&["commit", "-q", "-m", "init"]);
     a.git(&["branch", "feature"]);
     a.git(&["tag", "v1"]);
@@ -52,7 +54,7 @@ fn three_devices_share_a_git_project() {
     ]);
 
     wait("b to see the offer", || {
-        b.syncer(&["status"]).contains("project [")
+        b.syncer(&["status"]).contains("run: syncer accept project")
     });
     b.syncer(&["accept", "project", b.folder.to_str().expect("utf-8")]);
     c.syncer(&["accept", "project", c.folder.to_str().expect("utf-8")]);
@@ -70,6 +72,11 @@ fn three_devices_share_a_git_project() {
         assert!(
             device.read("target/build.out").is_none(),
             "ignored files stay home"
+        );
+        assert_eq!(
+            device.read("target/pinned.txt").as_deref(),
+            Some("tracked though ignored\n"),
+            "tracked files sync whatever .gitignore says"
         );
     }
 
@@ -153,10 +160,7 @@ fn three_devices_share_a_git_project() {
         "c's files wait while histories differ"
     );
     assert_eq!(c.head(), c_tip);
-    assert!(
-        c.syncer(&["status"])
-            .contains("git merge refs/syncer/conflicts/")
-    );
+    assert!(c.syncer(&["status"]).contains("run: git merge syncer/"));
 
     // Merging on a settles it for everyone, without restarting anything.
     let theirs = a
@@ -192,7 +196,7 @@ fn three_devices_share_a_git_project() {
     b.start();
     wait("b to refuse the folder", || {
         b.syncer(&["status"])
-            .contains("lost its .syncer/folder marker")
+            .contains("folder not found. If the drive is connected, run: syncer reset project")
     });
     std::thread::sleep(Duration::from_secs(3));
     assert!(a.read("readme.md").is_some() && c.read("readme.md").is_some());

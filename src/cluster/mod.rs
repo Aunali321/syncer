@@ -2,47 +2,12 @@
 //! every member holds a copy of, merged last writer wins. See DESIGN.md,
 //! "Cluster state".
 
-use crate::{
-    folder::Settings,
-    ids::{DeviceId, FolderId},
-};
+mod records;
+
+pub use records::{ClusterState, DeviceInfo, FolderInfo, Lww, Stamp};
+
+use crate::ids::{DeviceId, FolderId};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-
-/// When a value was written and by whom: the higher stamp wins.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct Stamp {
-    pub lamport: u64,
-    pub by: DeviceId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Lww<T> {
-    pub value: T,
-    pub stamp: Stamp,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceInfo {
-    pub name: String,
-    pub removed: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FolderInfo {
-    pub label: String,
-    pub settings: Settings,
-    pub removed: bool,
-}
-
-/// The replicated map.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClusterState {
-    pub devices: BTreeMap<DeviceId, Lww<DeviceInfo>>,
-    pub folders: BTreeMap<FolderId, Lww<FolderInfo>>,
-    /// Which devices hold which folders.
-    pub members: BTreeMap<FolderId, BTreeMap<DeviceId, Lww<bool>>>,
-}
 
 /// This device's copy of the cluster.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,19 +106,9 @@ impl Cluster {
         );
     }
 
-    pub fn set_folder(&mut self, id: FolderId, label: &str, settings: Settings, removed: bool) {
+    pub fn set_folder(&mut self, id: FolderId, info: FolderInfo) {
         let stamp = self.stamp();
-        self.state.folders.insert(
-            id,
-            Lww {
-                value: FolderInfo {
-                    label: label.to_owned(),
-                    settings,
-                    removed,
-                },
-                stamp,
-            },
-        );
+        self.state.folders.insert(id, Lww { value: info, stamp });
     }
 
     /// Records whether this device holds `folder`.
@@ -264,9 +219,19 @@ impl Cluster {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::folder::Settings;
 
     fn device(byte: u8) -> DeviceId {
         iroh::SecretKey::from_bytes(&[byte; 32]).public()
+    }
+
+    fn info(label: &str) -> FolderInfo {
+        FolderInfo {
+            label: label.to_owned(),
+            settings: Settings::default(),
+            removed: false,
+            home_path: None,
+        }
     }
 
     #[test]
@@ -279,10 +244,10 @@ mod tests {
         assert_eq!(on_a.state(), on_b.state());
 
         let folder = FolderId::random();
-        on_a.set_folder(folder.clone(), "notes", Settings::default(), false);
+        on_a.set_folder(folder.clone(), info("notes"));
         on_a.set_holding(&folder, true);
         on_b.merge(on_a.state());
-        on_b.set_folder(folder.clone(), "renamed", Settings::default(), false);
+        on_b.set_folder(folder.clone(), info("renamed"));
         on_a.merge(on_b.state());
 
         assert_eq!(on_a.state(), on_b.state());
@@ -326,7 +291,7 @@ mod tests {
         let mut cluster = Cluster::new(a, "laptop");
         cluster.set_device(b, "desk", false);
         let folder = FolderId::random();
-        cluster.set_folder(folder.clone(), "code", Settings::default(), false);
+        cluster.set_folder(folder.clone(), info("code"));
 
         assert_eq!(cluster.find_folder("code"), Some(folder.clone()));
         assert_eq!(cluster.find_folder(folder.as_str()), Some(folder));
@@ -355,7 +320,7 @@ mod tests {
     #[test]
     fn the_state_survives_json() {
         let mut cluster = Cluster::new(device(1), "laptop");
-        cluster.set_folder(FolderId::random(), "code", Settings::default(), false);
+        cluster.set_folder(FolderId::random(), info("code"));
         let json = serde_json::to_string(&cluster).expect("encodes");
         let back: Cluster = serde_json::from_str(&json).expect("decodes");
         assert_eq!(back.state(), cluster.state());

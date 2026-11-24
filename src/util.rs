@@ -17,25 +17,55 @@ pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Writes `bytes` to `path` whole or not at all: through a temporary file
 /// beside it, flushed, then renamed over it.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut temp = OsString::from(path);
-    temp.push(".tmp");
-    let temp = PathBuf::from(temp);
-    let mut file =
-        fs::File::create(&temp).with_context(|| format!("writing {}", temp.display()))?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(&temp, path).with_context(|| format!("writing {}", path.display()))
+    write_through_temp(path, bytes, fs::OpenOptions::new())
 }
 
-/// Writes `bytes` like `write_atomic`, readable by this user only.
+/// Writes `bytes` like `write_atomic`, readable by this user only from the
+/// moment the file exists.
 pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_atomic(path, bytes)?;
+    #[allow(unused_mut)]
+    let mut options = fs::OpenOptions::new();
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    write_through_temp(path, bytes, options)
+}
+
+/// The temporary file is named for this write alone, so writers racing on
+/// one path never share it: the last rename wins whole.
+fn write_through_temp(path: &Path, bytes: &[u8], mut options: fs::OpenOptions) -> Result<()> {
+    let mut temp = OsString::from(path);
+    temp.push(format!(".{:016x}.tmp", rand::random::<u64>()));
+    let temp = PathBuf::from(temp);
+    let mut file = options
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .with_context(|| format!("writing {}", temp.display()))?;
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&temp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
     }
-    Ok(())
+    written.with_context(|| format!("writing {}", path.display()))
+}
+
+/// An error and its causes for people, each said once: some errors already
+/// include their cause in their own message.
+pub fn describe(error: &anyhow::Error) -> String {
+    let mut text = String::new();
+    for cause in error.chain() {
+        let message = cause.to_string();
+        if text.contains(&message) {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push_str(": ");
+        }
+        text.push_str(&message);
+    }
+    text
 }
 
 /// A byte count for people: `1.5 MB`.

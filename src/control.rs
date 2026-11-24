@@ -3,7 +3,12 @@
 //! DESIGN.md, "Local control".
 
 use crate::{
-    folder::Settings, home::Home, ids::FolderId, net::wire, report::Report, service::Service,
+    folder::Settings,
+    home::{AcceptNew, Home},
+    ids::FolderId,
+    net::wire,
+    report::Report,
+    service::Service,
     util::write_private,
 };
 use anyhow::{Context, Result, bail};
@@ -18,6 +23,7 @@ pub enum Command {
     Invite,
     Join {
         ticket: String,
+        merge: bool,
     },
     Rename {
         name: String,
@@ -32,10 +38,10 @@ pub enum Command {
     },
     Accept {
         folder: String,
-        path: PathBuf,
+        path: Option<PathBuf>,
     },
     AutoAccept {
-        dir: Option<PathBuf>,
+        mode: AcceptNew,
     },
     Remove {
         folder: String,
@@ -141,7 +147,7 @@ async fn answer(
     let stopping = matches!(envelope.command, Command::Stop);
     let reply = match run(service, envelope.command).await {
         Ok(reply) => reply,
-        Err(e) => Reply::Failed(format!("{e:#}")),
+        Err(e) => Reply::Failed(crate::util::describe(&e)),
     };
     wire::send(&mut stream, &reply).await?;
 
@@ -152,32 +158,38 @@ async fn answer(
 }
 
 async fn run(service: &Arc<Service>, command: Command) -> Result<Reply> {
-    let folder = |query: &str| -> Result<FolderId> {
-        service.cluster().find_folder(query).with_context(|| {
-            format!("no folder is called {query:?} (use its id if two share a label)")
-        })
+    let folder = |query: &str| -> Result<(FolderId, String)> {
+        let cluster = service.cluster();
+        let id = cluster
+            .find_folder(query)
+            .with_context(|| format!("No folder named \"{query}\"."))?;
+        let label = cluster
+            .folder(&id)
+            .map_or_else(|| id.to_string(), |info| info.label.clone());
+        Ok((id, label))
     };
 
     Ok(match command {
-        Command::Status => Reply::Report(Box::new(service.report())),
+        Command::Status => Reply::Report(Box::new(crate::report::build(service))),
         Command::Invite => Reply::Done(service.invite().await?),
-        Command::Join { ticket } => {
-            let inviter = service.join(&ticket).await?;
-            Reply::Done(format!(
-                "Joined {inviter}'s devices. Folders they share show up in `syncer status`."
-            ))
+        Command::Join { ticket, merge } => {
+            let inviter = service.join(&ticket, merge).await?;
+            Reply::Done(format!("Connected to {inviter}."))
         }
         Command::Rename { name } => {
             service.rename(&name)?;
-            Reply::Done(format!("This device is now called {name}."))
+            Reply::Done(format!("Device renamed to \"{}\".", name.trim()))
         }
         Command::Forget { device } => {
             let cluster = service.cluster();
             let id = cluster
                 .find_device(&device)
-                .with_context(|| format!("no device is called {device:?}"))?;
+                .with_context(|| format!("No device named \"{device}\"."))?;
             service.forget_device(&id)?;
-            Reply::Done(format!("{} is no longer trusted.", cluster.name_of(&id)))
+            Reply::Done(format!(
+                "Removed {}. It can no longer sync with your devices.",
+                cluster.name_of(&id)
+            ))
         }
         Command::Add {
             path,
@@ -185,81 +197,79 @@ async fn run(service: &Arc<Service>, command: Command) -> Result<Reply> {
             use_gitignore,
         } => {
             let id = service.add_folder(&path, label, Settings { use_gitignore })?;
-            Reply::Done(format!(
-                "Sharing {} as {id}. Other devices can accept it now.",
-                path.display()
-            ))
+            let (_, label) = folder(id.as_str())?;
+            Reply::Done(format!("Sharing {label}."))
         }
         Command::Accept {
             folder: query,
             path,
         } => {
-            let id = folder(&query)?;
-            service.accept_folder(&id, &path)?;
-            Reply::Done(format!("Syncing {id} into {}.", path.display()))
+            let (id, label) = folder(&query)?;
+            let path = service.accept_folder(&id, path.as_deref())?;
+            Reply::Done(format!("Syncing {label} to {}.", path.display()))
         }
-        Command::AutoAccept { dir } => {
-            let dir = match dir {
-                Some(dir) => Some(std::path::absolute(&dir)?),
-                None => None,
+        Command::AutoAccept { mode } => {
+            let message = match &mode {
+                AcceptNew::Ask => {
+                    "Auto-accept off. New folders wait for `syncer accept`.".to_owned()
+                }
+                AcceptNew::SamePlace => {
+                    "Auto-accept on. New folders go where they are on the sharing device."
+                        .to_owned()
+                }
+                AcceptNew::Into(dir) => {
+                    format!("Auto-accept on. New folders go into {}.", dir.display())
+                }
             };
-            let message = match &dir {
-                Some(dir) => format!(
-                    "Offered folders are accepted into {} from now on.",
-                    dir.display()
-                ),
-                None => "Offered folders wait to be accepted.".to_owned(),
-            };
-            service.change_config(|config| config.auto_accept = dir)?;
+            service.change_config(|config| config.accept_new = mode)?;
             Reply::Done(message)
         }
         Command::Remove {
             folder: query,
             everywhere,
         } => {
-            let id = folder(&query)?;
+            let (id, label) = folder(&query)?;
             service.remove_folder(&id, everywhere)?;
             Reply::Done(if everywhere {
-                format!("{id} is no longer shared. The files stay on every device.")
+                format!("Stopped sharing {label}. Files stay on every device.")
             } else {
-                format!("{id} no longer syncs here. Its files stay.")
+                format!("Stopped syncing {label} here. Files stay.")
             })
         }
         Command::Pause {
             folder: query,
             paused,
         } => {
-            let id = folder(&query)?;
+            let (id, label) = folder(&query)?;
             service.pause(&id, paused)?;
-            Reply::Done(format!(
-                "{id} {}.",
-                if paused { "is paused" } else { "syncs again" }
-            ))
+            Reply::Done(if paused {
+                format!("Paused {label}.")
+            } else {
+                format!("Resumed {label}.")
+            })
         }
         Command::Rescan { folder: query } => {
-            let id = folder(&query)?;
+            let (id, label) = folder(&query)?;
             service.rescan(&id).await?;
-            Reply::Done(format!("{id} scanned."))
+            Reply::Done(format!("Rescanned {label}."))
         }
         Command::Reset { folder: query } => {
-            let id = folder(&query)?;
+            let (id, label) = folder(&query)?;
             service.reset(&id)?;
-            Reply::Done(format!(
-                "{id} starts over from a fresh scan. Nothing is deleted."
-            ))
+            Reply::Done(format!("Reset {label}. No files are deleted."))
         }
         Command::Stop => Reply::Done("Stopping.".to_owned()),
     })
 }
 
+const NOT_RUNNING: &str = "syncer isn't running. Start it with: syncer run";
+
 /// Sends `command` to the service running for `home`.
 pub async fn call(home: &Home, command: Command) -> Result<Reply> {
-    let address: Address = home
-        .read_json(&home.control())?
-        .context("the syncer service is not running (start it with `syncer run`)")?;
+    let address: Address = home.read_json(&home.control())?.context(NOT_RUNNING)?;
     let mut stream = TcpStream::connect(("127.0.0.1", address.port))
         .await
-        .context("the syncer service is not running (start it with `syncer run`)")?;
+        .context(NOT_RUNNING)?;
     wire::send(
         &mut stream,
         &Envelope {

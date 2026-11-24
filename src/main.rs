@@ -3,8 +3,8 @@ use clap::{Parser, Subcommand};
 use std::{path::PathBuf, process::ExitCode, sync::Arc};
 use syncer::{
     control::{self, Command, Reply},
-    home::Home,
-    net::node::NetOptions,
+    home::{AcceptNew, Home},
+    net::node::{NetOptions, Relays},
     service::Service,
 };
 
@@ -27,16 +27,23 @@ enum Commands {
         /// UDP port to listen on; by default one is picked
         #[arg(long, default_value_t = 0)]
         port: u16,
-        /// Do not use public relays or DNS lookup: only direct addresses and
-        /// the local network
+        /// Do not use relays or DNS lookup: only direct addresses and the
+        /// local network
         #[arg(long)]
         no_relays: bool,
+        /// Use this relay (an `iroh-relay` you run) instead of the public
+        /// ones; give it more than once for several
+        #[arg(long = "relay", value_name = "URL", conflicts_with = "no_relays")]
+        relays: Vec<iroh::RelayUrl>,
         /// Do not look for devices on the local network
         #[arg(long)]
         no_mdns: bool,
     },
-    /// Show this device, its peers and its folders
+    /// Show what needs attention
     Status {
+        /// Show every folder and device
+        #[arg(long)]
+        all: bool,
         /// Print JSON
         #[arg(long)]
         json: bool,
@@ -44,7 +51,13 @@ enum Commands {
     /// Print a one-use invite for another device (valid 15 minutes)
     Invite,
     /// Join the devices of an invite
-    Join { ticket: String },
+    Join {
+        ticket: String,
+        /// Bring the devices this one already trusts along: the inviting
+        /// device's devices trust them too
+        #[arg(long)]
+        merge: bool,
+    },
     /// Rename this device
     Name { name: String },
     /// Stop trusting a device, by name or id
@@ -59,9 +72,14 @@ enum Commands {
         #[arg(long)]
         no_gitignore: bool,
     },
-    /// Take a folder another device shares, into a local directory
-    Accept { folder: String, path: PathBuf },
-    /// Accept every offered folder into a directory, or stop doing so
+    /// Take a folder another device shares; by default to the same place
+    /// as on that device
+    Accept {
+        folder: String,
+        path: Option<PathBuf>,
+    },
+    /// Accept new folders without asking: where they are on the sharing
+    /// device, or into a directory
     AutoAccept {
         dir: Option<PathBuf>,
         #[arg(long, conflicts_with = "dir")]
@@ -81,7 +99,7 @@ enum Commands {
     /// Scan a folder now
     Rescan { folder: String },
     /// Start a folder over after its directory was replaced or remounted,
-    /// without deleting anything
+    /// or its saved state was damaged, without deleting anything
     Reset { folder: String },
     /// Stop the running service
     Stop,
@@ -97,7 +115,7 @@ fn main() -> ExitCode {
     match runtime.block_on(run(cli)) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            eprintln!("error: {}", syncer::util::describe(&e));
             ExitCode::FAILURE
         }
     }
@@ -110,23 +128,33 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         Commands::Run {
             port,
             no_relays,
+            relays,
             no_mdns,
         } => {
+            let relays = match (no_relays, relays.is_empty()) {
+                (true, _) => Relays::Off,
+                (false, true) => Relays::Public,
+                (false, false) => Relays::Own(relays),
+            };
             serve(
                 home,
                 NetOptions {
                     port,
-                    relays: !no_relays,
+                    relays,
                     mdns: !no_mdns,
                 },
             )
             .await?;
             return Ok(ExitCode::SUCCESS);
         }
-        Commands::Status { json } => {
+        Commands::Status { all, json } => {
             return match control::call(&home, Command::Status).await? {
                 Reply::Report(report) if json => {
                     println!("{}", serde_json::to_string_pretty(&report)?);
+                    Ok(ExitCode::SUCCESS)
+                }
+                Reply::Report(report) if all => {
+                    print!("{}", syncer::report::Full(&report));
                     Ok(ExitCode::SUCCESS)
                 }
                 Reply::Report(report) => {
@@ -137,7 +165,7 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             };
         }
         Commands::Invite => Command::Invite,
-        Commands::Join { ticket } => Command::Join { ticket },
+        Commands::Join { ticket, merge } => Command::Join { ticket, merge },
         Commands::Name { name } => Command::Rename { name },
         Commands::Forget { device } => Command::Forget { device },
         Commands::Add {
@@ -151,13 +179,13 @@ async fn run(cli: Cli) -> Result<ExitCode> {
         },
         Commands::Accept { folder, path } => Command::Accept {
             folder,
-            path: std::path::absolute(path)?,
+            path: path.map(std::path::absolute).transpose()?,
         },
         Commands::AutoAccept { dir, off } => Command::AutoAccept {
-            dir: if off {
-                None
-            } else {
-                dir.map(std::path::absolute).transpose()?
+            mode: match (off, dir) {
+                (true, _) => AcceptNew::Ask,
+                (false, Some(dir)) => AcceptNew::Into(std::path::absolute(dir)?),
+                (false, None) => AcceptNew::SamePlace,
             },
         },
         Commands::Remove { folder, everywhere } => Command::Remove { folder, everywhere },

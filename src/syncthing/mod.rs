@@ -1,7 +1,11 @@
 //! Noticing folders Syncthing already syncs. Two tools syncing the same files
 //! fight over every change, so a folder that overlaps an active Syncthing
-//! folder does not start. See DESIGN.md, "Syncthing".
+//! folder does not start, unless that folder's `.stignore` leaves out
+//! everything under it. See DESIGN.md, "Syncthing".
 
+mod ignores;
+
+use ignores::Ignores;
 use std::path::{Path, PathBuf};
 
 /// Why syncer must leave `path` alone, if an active Syncthing folder
@@ -15,20 +19,30 @@ pub fn managing(path: &Path) -> Option<String> {
     folders
         .into_iter()
         .filter(|folder| !folder.paused)
-        .find(|folder| {
+        .find_map(|folder| {
             let theirs = folder
                 .path
                 .canonicalize()
                 .unwrap_or_else(|_| folder.path.clone());
-            path.starts_with(&theirs) || theirs.starts_with(&path)
-        })
-        .map(|folder| {
-            format!(
-                "Syncthing syncs this directory as its folder {:?} at {}. Pause or remove it in \
-                 Syncthing first; two tools syncing the same files fight over every change",
-                folder.label,
-                folder.path.display()
-            )
+            if theirs.starts_with(&path) {
+                return Some(format!(
+                    "Syncthing syncs {} inside this. Pause it in Syncthing first.",
+                    theirs.display()
+                ));
+            }
+            let inside = path.strip_prefix(&theirs).ok()?;
+            let parts: Vec<String> = inside
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            if !parts.is_empty() && Ignores::read(&theirs.join(".stignore")).leave_out(&parts) {
+                return None;
+            }
+            Some(format!(
+                "Already synced by Syncthing. Add /{} to {} first.",
+                parts.join("/"),
+                theirs.join(".stignore").display()
+            ))
         })
 }
 

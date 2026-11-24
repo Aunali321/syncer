@@ -2,7 +2,11 @@
 //! the check on incoming entries, so the two always agree. See DESIGN.md,
 //! "Rules".
 
-use crate::folder::OWN_DIR;
+mod tracked;
+
+pub use tracked::Tracked;
+
+use crate::folder::{MARKER, OWN_DIR};
 use ignore::{
     Match,
     gitignore::{Gitignore, GitignoreBuilder},
@@ -32,29 +36,52 @@ struct DirRules {
 /// read when first needed; make a new `Rules` to see edits to them.
 pub struct Rules {
     root: PathBuf,
-    /// Whether `.gitignore` files and `.git/info/exclude` apply.
+    /// Whether Git's ignore files apply: `.gitignore` files,
+    /// `.git/info/exclude` and the user's global excludes file.
     gitignore: bool,
-    exclude: Option<Gitignore>,
+    /// `.git/info/exclude`, then the global excludes file.
+    excludes: Vec<Gitignore>,
+    tracked: Arc<Tracked>,
     dirs: Mutex<HashMap<String, Arc<DirRules>>>,
-    nested_git: Mutex<HashMap<String, bool>>,
+    nested: Mutex<HashMap<String, bool>>,
 }
 
 impl Rules {
-    /// The rules of the folder at `root`. `.gitignore` applies when the folder
-    /// is a Git checkout and `use_gitignore` is set.
-    pub fn new(root: &Path, use_gitignore: bool) -> Self {
+    /// The rules of the folder at `root`. Git's ignore files apply when the
+    /// folder is a Git checkout and `use_gitignore` is set, to every path
+    /// but those `tracked` holds.
+    pub fn new(root: &Path, use_gitignore: bool, tracked: Arc<Tracked>) -> Self {
         let gitignore = use_gitignore && root.join(".git").is_dir();
-        let exclude = gitignore
-            .then(|| read(root, &root.join(".git/info/exclude")))
-            .flatten();
+        let excludes = if gitignore {
+            [
+                Some(root.join(".git/info/exclude")),
+                ignore::gitignore::gitconfig_excludes_path(),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(|file| read(root, &file))
+            .collect()
+        } else {
+            Vec::new()
+        };
 
         Self {
             root: root.to_owned(),
             gitignore,
-            exclude,
+            excludes,
+            tracked,
             dirs: Mutex::default(),
-            nested_git: Mutex::default(),
+            nested: Mutex::default(),
         }
+    }
+
+    /// Whether Git's ignore files apply, and so what HEAD tracks matters.
+    pub fn follows_git(&self) -> bool {
+        self.gitignore
+    }
+
+    pub fn tracked(&self) -> &Arc<Tracked> {
+        &self.tracked
     }
 
     /// Whether `path`, relative to the root and joined with `/`, is left out.
@@ -72,15 +99,20 @@ impl Rules {
             return true;
         }
 
+        // Git's files leave out nothing HEAD tracks, nor a directory holding
+        // something it tracks; under such a directory they still leave out
+        // what is untracked, as Git does.
+        let git = self.gitignore && !self.tracked.covers(path, is_dir);
+
         for depth in 1..=parts.len() {
             let sub = &parts[..depth];
             let sub_is_dir = depth < parts.len() || is_dir;
 
-            if sub_is_dir && self.is_nested_repo(&sub.join("/")) {
+            if sub_is_dir && self.is_nested_root(&sub.join("/")) {
                 return true;
             }
 
-            if self.matched(sub, sub_is_dir) {
+            if self.matched(sub, sub_is_dir, git) {
                 return true;
             }
         }
@@ -90,14 +122,18 @@ impl Rules {
 
     /// Whether the ignore files exclude `parts` itself, its parents aside.
     /// The deepest directory's files win; in one directory `.syncerignore`
-    /// wins over `.gitignore`; `.git/info/exclude` comes last.
-    fn matched(&self, parts: &[&str], is_dir: bool) -> bool {
+    /// wins over `.gitignore`; `.git/info/exclude` and the global excludes
+    /// file come last. Git's files count only when `git` is set.
+    fn matched(&self, parts: &[&str], is_dir: bool, git: bool) -> bool {
+        let path = parts.join("/");
+
         for dir_depth in (0..parts.len()).rev() {
             let dir = parts[..dir_depth].join("/");
             let rules = self.dir(&dir);
             let relative = parts[dir_depth..].join("/");
+            let git_rules = rules.git.as_ref().filter(|_| git);
 
-            for matcher in [&rules.syncer, &rules.git].into_iter().flatten() {
+            for matcher in [rules.syncer.as_ref(), git_rules].into_iter().flatten() {
                 match matcher.matched(&relative, is_dir) {
                     Match::Ignore(_) => return true,
                     Match::Whitelist(_) => return false,
@@ -106,9 +142,12 @@ impl Rules {
             }
         }
 
-        self.exclude
-            .as_ref()
-            .is_some_and(|exclude| exclude.matched(parts.join("/"), is_dir).is_ignore())
+        git && self
+            .excludes
+            .iter()
+            .map(|exclude| exclude.matched(&path, is_dir))
+            .find(|matched| !matched.is_none())
+            .is_some_and(|matched| matched.is_ignore())
     }
 
     fn dir(&self, dir: &str) -> Arc<DirRules> {
@@ -132,15 +171,18 @@ impl Rules {
         rules
     }
 
-    /// Whether the directory `dir` holds its own repository: a submodule or a
-    /// nested clone, which stays on its machine.
-    fn is_nested_repo(&self, dir: &str) -> bool {
-        if let Some(&nested) = crate::util::lock(&self.nested_git).get(dir) {
+    /// Whether the directory `dir` is the root of something synced on its
+    /// own: a submodule or nested clone, which stays on its machine, or
+    /// another syncer folder.
+    fn is_nested_root(&self, dir: &str) -> bool {
+        if let Some(&nested) = crate::util::lock(&self.nested).get(dir) {
             return nested;
         }
 
-        let nested = std::fs::symlink_metadata(self.root.join(dir).join(".git")).is_ok();
-        crate::util::lock(&self.nested_git).insert(dir.to_owned(), nested);
+        let at = self.root.join(dir);
+        let nested = std::fs::symlink_metadata(at.join(".git")).is_ok()
+            || at.join(OWN_DIR).join(MARKER).is_file();
+        crate::util::lock(&self.nested).insert(dir.to_owned(), nested);
         nested
     }
 }
@@ -184,7 +226,7 @@ mod tests {
     #[test]
     fn git_and_own_folders_are_always_left_out() {
         let dir = folder(false);
-        let rules = Rules::new(dir.path(), true);
+        let rules = Rules::new(dir.path(), true, Default::default());
 
         assert!(rules.excluded(".git", true));
         assert!(rules.excluded("sub/.git/config", false));
@@ -198,7 +240,7 @@ mod tests {
         for git in [true, false] {
             let dir = folder(git);
             fs::write(dir.path().join(".gitignore"), "target/\n*.log\n").expect("write");
-            let rules = Rules::new(dir.path(), true);
+            let rules = Rules::new(dir.path(), true, Default::default());
 
             assert_eq!(rules.excluded("target", true), git);
             assert_eq!(rules.excluded("target/debug/app", false), git);
@@ -212,7 +254,7 @@ mod tests {
         let dir = folder(true);
         fs::write(dir.path().join(".gitignore"), ".env\nbuild/\n").expect("write");
         fs::write(dir.path().join(IGNORE_FILE), "!.env\nnotes/\n").expect("write");
-        let rules = Rules::new(dir.path(), true);
+        let rules = Rules::new(dir.path(), true, Default::default());
 
         assert!(!rules.excluded(".env", false));
         assert!(rules.excluded("build/x", false));
@@ -225,7 +267,7 @@ mod tests {
         fs::create_dir_all(dir.path().join("web")).expect("mkdir");
         fs::write(dir.path().join(".gitignore"), "*.gen\ncache/\n").expect("write");
         fs::write(dir.path().join("web/.gitignore"), "!keep.gen\n!cache/\n").expect("write");
-        let rules = Rules::new(dir.path(), true);
+        let rules = Rules::new(dir.path(), true, Default::default());
 
         assert!(rules.excluded("a.gen", false));
         assert!(!rules.excluded("web/keep.gen", false));
@@ -238,8 +280,8 @@ mod tests {
         fs::write(dir.path().join(".git/info/exclude"), "scratch/\n").expect("write");
         fs::write(dir.path().join(".gitignore"), "*.o\n").expect("write");
 
-        assert!(Rules::new(dir.path(), true).excluded("scratch/x", false));
-        let off = Rules::new(dir.path(), false);
+        assert!(Rules::new(dir.path(), true, Default::default()).excluded("scratch/x", false));
+        let off = Rules::new(dir.path(), false, Default::default());
         assert!(!off.excluded("scratch/x", false));
         assert!(!off.excluded("main.o", false));
     }
@@ -248,10 +290,58 @@ mod tests {
     fn nested_repositories_stay_on_their_machine() {
         let dir = folder(true);
         fs::create_dir_all(dir.path().join("vendor/lib/.git")).expect("mkdir");
-        let rules = Rules::new(dir.path(), true);
+        let rules = Rules::new(dir.path(), true, Default::default());
 
         assert!(rules.excluded("vendor/lib", true));
         assert!(rules.excluded("vendor/lib/src/a.c", false));
         assert!(!rules.excluded("vendor/other.c", false));
+    }
+
+    #[test]
+    fn nested_folders_stay_with_their_own_folder() {
+        let dir = folder(false);
+        fs::create_dir_all(dir.path().join("repo/.syncer")).expect("mkdir");
+        fs::write(dir.path().join("repo/.syncer/folder"), "id").expect("write");
+        fs::create_dir_all(dir.path().join("notes/.syncer")).expect("mkdir");
+        let rules = Rules::new(dir.path(), true, Default::default());
+
+        assert!(rules.excluded("repo/src/a.rs", false));
+        assert!(
+            !rules.excluded("notes/today.md", false),
+            "a .syncer directory without a marker is not a folder"
+        );
+    }
+
+    #[test]
+    fn git_ignores_nothing_head_tracks() {
+        let dir = folder(true);
+        fs::write(dir.path().join(".gitignore"), "*.md\ntarget/\n").expect("write");
+        let tracked = Tracked::new(
+            None,
+            ["docs/kept.md", "target/pinned.bin"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+        let rules = Rules::new(dir.path(), true, Arc::new(tracked));
+
+        assert!(!rules.excluded("docs/kept.md", false));
+        assert!(rules.excluded("docs/other.md", false));
+        assert!(!rules.excluded("target", true), "it holds a tracked file");
+        assert!(!rules.excluded("target/pinned.bin", false));
+        assert!(
+            rules.excluded("target/debug/app", false),
+            "untracked files under it stay out"
+        );
+    }
+
+    #[test]
+    fn syncerignore_applies_to_tracked_paths_too() {
+        let dir = folder(true);
+        fs::write(dir.path().join(IGNORE_FILE), "secret.txt\n").expect("write");
+        let tracked = Tracked::new(None, ["secret.txt".to_owned()].into());
+        let rules = Rules::new(dir.path(), true, Arc::new(tracked));
+
+        assert!(rules.excluded("secret.txt", false));
     }
 }

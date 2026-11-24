@@ -1,7 +1,7 @@
 //! One-use invites. See DESIGN.md, "Pairing".
 
 use crate::util::lock;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -37,11 +37,12 @@ impl Ticket {
         let body = text
             .trim()
             .strip_prefix(PREFIX)
-            .context("not a syncer invite")?;
+            .context("That isn't a syncer invite.")?;
+        let damaged = || anyhow!("That invite is incomplete. Copy the whole thing.");
         let bytes = data_encoding::BASE32_NOPAD
             .decode(body.to_ascii_uppercase().as_bytes())
-            .context("the invite is damaged")?;
-        rmp_serde::from_slice(&bytes).context("the invite is damaged")
+            .map_err(|_| damaged())?;
+        rmp_serde::from_slice(&bytes).map_err(|_| damaged())
     }
 }
 

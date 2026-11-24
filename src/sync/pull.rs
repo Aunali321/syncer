@@ -120,7 +120,10 @@ async fn once(node: &Node, folder: &Arc<Folder>, peer: DeviceId) -> Result<()> {
                     .await;
                 if let Err(e) = aligned {
                     tracing::warn!("{}: Git from {}: {e:#}", folder.id, short(&peer));
-                    folder.set_waiting(&peer, Some(format!("Git: {e:#}")));
+                    folder.set_waiting(
+                        &peer,
+                        Some(format!("Git sync failed: {}", crate::util::describe(&e))),
+                    );
                     held = true;
                     continue;
                 }
@@ -139,7 +142,7 @@ async fn once(node: &Node, folder: &Arc<Folder>, peer: DeviceId) -> Result<()> {
                 }
                 if !entries.is_empty() && !folder.accepts(peer_head.as_ref()) {
                     let why = format!(
-                        "its checkout is at {}, this one at {}",
+                        "different commit checked out ({} there, {} here)",
                         describe(peer_head.as_ref()),
                         describe(folder.head_commit().as_ref())
                     );
@@ -149,8 +152,13 @@ async fn once(node: &Node, folder: &Arc<Folder>, peer: DeviceId) -> Result<()> {
                 }
 
                 cursor.seq = upto;
+                let caught_up = entries.is_empty();
                 folder.merge(&peer, &entries, cursor);
                 folder.set_waiting(&peer, None);
+                // The peer ends what it has with an empty batch.
+                if caught_up {
+                    folder.caught_up_with(&peer);
+                }
             }
             PullMessage::Refused(why) => bail!("refused: {why}"),
         }

@@ -2,16 +2,16 @@
 //! changed, applies what peers changed, fetches content, follows each peer
 //! that holds the folder and saves the state.
 
+use super::watch::{Event, watch_folder};
 use crate::{
-    folder::{Folder, OWN_DIR, index::Hash, scan::Scope},
+    folder::{Folder, index::Hash, scan::Scope},
     ids::DeviceId,
     net::node::Node,
     sync::{fetch, pull},
+    util::bytes,
 };
-use notify::{EventKind, RecursiveMode, Watcher as _};
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
-    path::{Component, Path},
+    collections::{BTreeSet, HashMap},
     sync::Arc,
     time::Duration,
 };
@@ -41,13 +41,6 @@ const GIVE_UP: Duration = Duration::from_secs(30);
 /// How long an apply round waits for more downloads to finish, so a burst
 /// of small files is placed in a few rounds rather than one each.
 const GATHER: Duration = Duration::from_millis(250);
-
-/// What the watcher reports.
-enum Event {
-    Paths(Vec<String>),
-    Git,
-    Everything,
-}
 
 /// What the next scan covers.
 #[derive(Default)]
@@ -90,10 +83,11 @@ pub async fn run(node: Arc<Node>, folder: Arc<Folder>, mut peers: watch::Receive
     let mut save = interval(SAVE);
     let mut due = Due::default();
     let mut pullers: HashMap<DeviceId, AbortOnDropHandle<()>> = HashMap::new();
-    let mut fetches: JoinSet<(Hash, anyhow::Result<fetch::Fetched>)> = JoinSet::new();
+    let mut fetches: JoinSet<(Hash, String, anyhow::Result<fetch::Fetched>)> = JoinSet::new();
     // Content every peer said it does not have, and since when.
     let mut nowhere: HashMap<Hash, Instant> = HashMap::new();
-    let mut in_flight: HashSet<Hash> = HashSet::new();
+    // Downloads under way, with the bytes each may still write.
+    let mut in_flight: HashMap<Hash, u64> = HashMap::new();
     let mut queued: Vec<(Hash, String)> = Vec::new();
     // When the next apply round runs; rounds gather what arrives meanwhile.
     let mut apply_at: Option<Instant> = None;
@@ -128,12 +122,12 @@ pub async fn run(node: Arc<Node>, folder: Arc<Folder>, mut peers: watch::Receive
                 apply(&folder, &mut queued).await;
             }
             Some(joined) = fetches.join_next() => {
-                if let Ok((hash, result)) = joined {
+                if let Ok((hash, path, result)) = joined {
                     in_flight.remove(&hash);
                     match result {
                         Ok(fetch::Fetched::Done) => {
                             nowhere.remove(&hash);
-                            folder.work.notify_one();
+                            folder.content_arrived(&hash);
                         }
                         // Asked twice, a while apart, of every device that
                         // holds the folder: it exists nowhere.
@@ -151,6 +145,7 @@ pub async fn run(node: Arc<Node>, folder: Arc<Folder>, mut peers: watch::Receive
                         Err(e) => {
                             nowhere.remove(&hash);
                             tracing::debug!("{}: fetching {}: {e:#}", folder.id, hash.short());
+                            folder.note_problem(&path, format!("download failed: {}", crate::util::describe(&e)));
                         }
                     }
                 }
@@ -160,6 +155,8 @@ pub async fn run(node: Arc<Node>, folder: Arc<Folder>, mut peers: watch::Receive
                     due.add(Event::Paths(std::mem::take(&mut unsettled).into_iter().collect()));
                 }
                 folder.drop_unwanted_downloads();
+                // Downloads that failed or waited for space go again.
+                queued = folder.awaited();
                 folder.work.notify_one();
             }
             _ = save.tick() => {
@@ -175,18 +172,33 @@ pub async fn run(node: Arc<Node>, folder: Arc<Folder>, mut peers: watch::Receive
             }
         }
 
-        // Start downloads for what the last round could not place.
+        // Start downloads for what the last round could not place, as far as
+        // the disk has room for all of them to finish: started ones that
+        // share out the last of the space would each stop short.
         let holders: Vec<DeviceId> = peers.borrow().clone();
         while in_flight.len() < PARALLEL_FETCHES
             && let Some((hash, path)) = queued.pop()
         {
-            if holders.is_empty() || !in_flight.insert(hash) {
+            if holders.is_empty() || in_flight.contains_key(&hash) {
                 continue;
             }
+            let need = folder.still_to_fetch(&hash, &path);
+            let promised: u64 = in_flight.values().sum();
+            let free = folder
+                .free_space()
+                .map_or(u64::MAX, |free| free.saturating_sub(promised));
+            if need > free {
+                folder.note_problem(
+                    &path,
+                    format!("needs {} more disk space", bytes(need - free)),
+                );
+                continue;
+            }
+            in_flight.insert(hash, need);
             let (node, folder, holders) = (node.clone(), folder.clone(), ordered(&node, &holders));
             fetches.spawn(async move {
                 let result = fetch::content(&node, &folder, &holders, hash, &path).await;
-                (hash, result)
+                (hash, path, result)
             });
         }
     }
@@ -213,7 +225,7 @@ async fn apply(folder: &Arc<Folder>, queued: &mut Vec<(Hash, String)>) {
             if round.done > 0 {
                 tracing::debug!("{}: {} paths brought in line", folder.id, round.done);
             }
-            *queued = round.fetch;
+            queued.extend(round.fetch);
         }
         Err(e) => tracing::warn!("{}: {e:#}", folder.id),
     }
@@ -248,112 +260,4 @@ fn ordered(node: &Node, peers: &[DeviceId]) -> Vec<DeviceId> {
 
 fn far_future() -> Instant {
     Instant::now() + Duration::from_secs(365 * 24 * 3600)
-}
-
-/// Watches `root`, sending what changed. `None` when the folder cannot be
-/// watched (too many directories for the system's limit, say); it is then
-/// scanned on a timer.
-fn watch_folder(
-    root: &Path,
-    events: mpsc::UnboundedSender<Event>,
-) -> Option<notify::RecommendedWatcher> {
-    let root_owned = root.canonicalize().unwrap_or_else(|_| root.to_owned());
-    let handler = move |result: notify::Result<notify::Event>| {
-        let event = match result {
-            Ok(event) if event.need_rescan() => Event::Everything,
-            Ok(event) if matches!(event.kind, EventKind::Access(_)) => return,
-            Ok(event) => {
-                let mut paths = Vec::new();
-                let mut git = false;
-                for path in &event.paths {
-                    match classify(&root_owned, path) {
-                        Some(Seen::File(path)) => paths.push(path),
-                        Some(Seen::Git) => git = true,
-                        None => {}
-                    }
-                }
-                if !paths.is_empty() {
-                    let _ = events.send(Event::Paths(paths));
-                }
-                if git {
-                    let _ = events.send(Event::Git);
-                }
-                return;
-            }
-            Err(_) => Event::Everything,
-        };
-        let _ = events.send(event);
-    };
-
-    let mut watcher = match notify::recommended_watcher(handler) {
-        Ok(watcher) => watcher,
-        Err(e) => {
-            tracing::warn!(
-                "{}: not watched, scanning every minute instead: {e}",
-                root.display()
-            );
-            return None;
-        }
-    };
-
-    match watcher.watch(root, RecursiveMode::Recursive) {
-        Ok(()) => Some(watcher),
-        Err(e) => {
-            tracing::warn!(
-                "{}: not watched, scanning every minute instead: {e}",
-                root.display()
-            );
-            None
-        }
-    }
-}
-
-enum Seen {
-    File(String),
-    Git,
-}
-
-/// What an event at `path` concerns: a folder path, the repository's refs
-/// or HEAD, or nothing syncer follows.
-fn classify(root: &Path, path: &Path) -> Option<Seen> {
-    let relative = path.strip_prefix(root).ok()?;
-    let parts: Vec<&str> = relative
-        .components()
-        .map(|part| match part {
-            Component::Normal(name) => name.to_str(),
-            _ => None,
-        })
-        .collect::<Option<_>>()?;
-
-    match parts.first().copied()? {
-        OWN_DIR => None,
-        ".git" => match parts.get(1).copied() {
-            Some(
-                "HEAD" | "refs" | "packed-refs" | "MERGE_HEAD" | "rebase-merge" | "rebase-apply"
-                | "index.lock",
-            ) => Some(Seen::Git),
-            _ => None,
-        },
-        _ => Some(Seen::File(parts.join("/"))),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn events_are_sorted_by_what_they_touch() {
-        let root = Path::new("/w");
-        assert!(
-            matches!(classify(root, Path::new("/w/src/a.rs")), Some(Seen::File(path)) if path == "src/a.rs")
-        );
-        assert!(matches!(
-            classify(root, Path::new("/w/.git/refs/heads/main")),
-            Some(Seen::Git)
-        ));
-        assert!(classify(root, Path::new("/w/.git/objects/ab/cd")).is_none());
-        assert!(classify(root, Path::new("/w/.syncer/tmp/x")).is_none());
-        assert!(classify(root, Path::new("/elsewhere")).is_none());
-    }
 }

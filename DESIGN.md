@@ -114,9 +114,38 @@ needs, then carries it out without the lock:
 Content no file here has is fetched from a peer that holds the folder, into
 a partial file in `.syncer/tmp` that the next attempt resumes. It counts only
 once its blake3 hash matches. Content waiting there is served to peers too.
+A path whose content is being fetched leaves the pending list for a list of
+paths waiting for content, by hash, and comes back when that content
+arrives, when a file here comes to hold it, or when its entry changes. So an
+apply round costs what changed since the last one, not every file still
+downloading; the retry timer asks again for whatever still waits.
+A download starts only when the free space covers what it still needs plus
+what the downloads already running may still write: downloads that share out
+the last of the space would each stop short, none finishing. A path waiting
+for space, or whose download failed, says so in `syncer status`.
 
-On case-insensitive file systems a new path whose name differs only by case
-from an existing one is refused and reported, never written over it.
+Runs of zeros are skipped over rather than written, in downloads and local
+copies alike, so a sparse file (a disk image, a database) stays sparse.
+
+### Names
+
+One rule decides which paths can sync, on every device: plain names joined
+with `/`, none of them `.` or `..`, none holding a backslash (Windows reads it
+as a separator) or a control character, none a spelling of `.git` (in any
+case, with the trailing dots and spaces Windows drops, with the code points
+HFS+ ignores, or as the short name `GIT~1`), and not `.syncer` at the root.
+A scan leaves out a name that breaks it, or one that is not UTF-8, and lists
+it in `syncer status`; it is never sent. A device still checks what it
+receives against the rule, for a peer that does not keep to it.
+
+Whether a file system can store a valid name is a separate question, asked
+where the name is written. Each folder probes its file system when it opens:
+whether it treats names that differ by case as one (macOS, Windows), drops
+dots and spaces at the end of a name (FAT, and Windows' own calls), or treats
+a name's Unicode forms as one (macOS). A new path the file system would
+store under another name, or take for a path already there, is refused and
+reported, never written over it. On Windows, names Windows does not allow
+(`aux`, `a:b`) are refused the same way.
 
 ### A file and a directory at one path
 
@@ -170,13 +199,25 @@ minutes, and whenever the watcher reports an overflow.
 
 Paths are excluded in this order:
 
-1. Always: `.git` at any depth, `.syncer/`, and any
-   directory that holds its own `.git` (nested repositories and submodules
-   stay on their machine).
+1. Always: `.git` at any depth, `.syncer/`, any directory that holds its own
+   `.git` (nested repositories and submodules stay on their machine), and any
+   directory that is another folder's root (it holds `.syncer/folder`).
 2. `.syncerignore` files, in `.gitignore` syntax, at any depth. A `!pattern`
    here re-includes something `.gitignore` excludes, for example `!.env`.
-3. In Git folders, `.gitignore` files and `.git/info/exclude`. Ignored build
+3. In Git folders, Git's own ignore files, as Git reads them: `.gitignore`
+   files, then `.git/info/exclude`, then the user's global excludes file
+   (`core.excludesFile`, by default `~/.config/git/ignore`). Ignored build
    output is not synced. This can be turned off per folder.
+
+Git's ignore files never leave out a path the checked-out commit tracks, as
+`git status` still shows a tracked file that a pattern matches; nor a
+directory holding one, though untracked files in it stay out. File changes
+only flow between devices whose checkouts are at the same commit, so both
+sides judge a path by the same tracked set. A file added with `git add -f`
+syncs once it is committed.
+
+`.git/info/exclude` and the global excludes file are each device's own: a
+path one device excludes that way is simply not synced from or to it.
 
 An excluded path is invisible: it is never scanned, never written, and a path
 becoming excluded does not delete it anywhere.
@@ -186,8 +227,21 @@ becoming excluded does not delete it anywhere.
 `.syncer/folder` in the folder root holds the folder id. A scan that finds it
 missing or naming another folder stops the folder with an error instead of
 reading every file as deleted. This is what keeps an unmounted disk or a
-replaced directory from wiping the other devices. `syncer reset <folder>`
-starts the folder over from a fresh scan that deletes nothing.
+replaced directory from wiping the other devices. A folder whose state file
+exists has synced here before, however few files it held: its directory is
+never made anew. `syncer reset <folder>` starts the folder over from a fresh
+scan that deletes nothing. A damaged state file starts the folder over by
+itself, from the disk alone: everything there is recorded as new, so it
+meets the other devices' entries as concurrent edits, a conflict copy where
+they differ and never a deletion.
+
+### Folders inside folders
+
+A folder can sit inside another, as a repository's folder inside a folder of
+notes and repositories. The outer folder leaves the inner one out (rule 1),
+as it does a nested repository. A directory of a Git checkout cannot be its
+own folder, though: the outer folder would leave out files its commits
+track.
 
 ## Git sync
 
@@ -217,7 +271,7 @@ For each branch a peer advertises, the receiving device decides:
 | at `L` | `T == L` | nothing |
 | at `L` | `L` is an ancestor of `T` | fast-forward to `T` |
 | at `L` | `T` is an ancestor of `L` | nothing (the peer will fast-forward) |
-| at `L` | diverged | keep `L`, store `T` as `refs/syncer/conflicts/<device>/<branch>` |
+| at `L` | diverged | keep `L`, store `T` as `refs/syncer/<device>/<branch>` |
 
 For a tombstone `(branch, C)` a peer advertises, a local branch at `L` is
 deleted only when `L` is contained in `C`. A branch that moved on since stays
@@ -288,6 +342,13 @@ sanitized config, every branch and tag, and the peer's HEAD. The working tree
 then arrives through file sync. The same happens when `.git` is deleted on a
 device: the deletion is not mirrored, the repository comes back from a peer.
 
+What a device last fetched from a remote (`refs/remotes/*`) is its own and
+does not sync, so a new repository starts without it, and `git status`
+could not compare a branch with its upstream. Once it is made, the device
+runs `git fetch --all` once in the background. It never prompts, and the
+remotes it reaches are only those the sanitized config lets through. When
+it fails (offline, no credentials), a fetch by hand does the same.
+
 ## Devices and trust
 
 ### Pairing
@@ -298,6 +359,11 @@ The ticket carries the inviter's address and a 32-byte secret. `syncer join
 secret and its name. The inviter adds the device to the cluster state and
 answers with the whole state, so the new device trusts every member at once.
 The other members learn about it as the state spreads.
+
+The joining device's own state spreads the same way: if it already trusts
+other devices, the inviter's devices come to trust them too. `syncer join`
+refuses that unless given `--merge`, so two sets of devices only become one
+on purpose.
 
 ### Cluster state
 
@@ -315,9 +381,23 @@ loses every connection and pull it has open at once.
 
 ### Folder offers
 
-A folder in the catalog that this device does not hold is an offer. `syncer
-accept` picks a local path for it. A device can also accept automatically
-into a directory of its choice.
+A folder in the catalog that this device does not hold is an offer. The
+device that shares a folder records where it keeps it, from its home
+directory, and `syncer accept` puts the folder in the same place by default,
+or wherever it is told. A device can also accept every offer by itself, the
+same way or into one directory. A place from a peer is only ever a plain
+path under this device's home directory.
+
+Accepting records that this device holds the folder before the folder
+starts. A device asked for a folder by a member it has not yet heard holds
+it exchanges cluster state with that member first, and only refuses if the
+member still does not hold it: a fresh accept starts syncing at once rather
+than waiting for gossip.
+
+A folder reports "up to date" only once this device has read the whole index
+of at least one other device holding it, since it started; until then it is
+waiting to hear from them, and the status says when each was last heard
+from. Every device keeps that time for each peer across restarts.
 
 ## Wire protocol
 
@@ -328,27 +408,50 @@ Two ALPNs:
   request: `Cluster`, `Pull`, `Get` (file content, resumable by offset),
   `Pack` (Git objects).
 
-Paths from peers are checked before anything is merged: relative, no `..`,
-no control characters, nothing that names `.git` on any file system (`.git`
-in any case, `.git.` and `.git ` which Windows reads as `.git`, `GIT~1`),
-and on Windows no device names, streams or names Windows would change.
+Paths from peers are checked against the naming rule (see "Names") before
+anything is merged.
 
 Messages are length-prefixed MessagePack. File content and packs travel as a
 sequence of chunk messages. The receiver verifies every file against its
 blake3 hash before it is placed.
 
+### Reaching devices
+
+Devices connect directly where they can: addresses remembered from the last
+connection, mDNS on the local network, then hole punching. Where they
+cannot, traffic goes through a relay: iroh's public relays by default, which
+limit how fast one device may send, or relays you run yourself (`syncer run
+--relay <url>`, an `iroh-relay` server), or none (`--no-relays`, which also
+skips iroh's DNS address lookup). `syncer status` says which devices are
+connected through a relay.
+
 ## Syncthing
 
-A folder inside a directory that Syncthing shares (and has not paused) is not
+A folder that overlaps a folder Syncthing shares (and has not paused) is not
 started, and says why. Two tools syncing the same files fight over every
 change. Pause the folder in Syncthing, or remove it there, and syncer takes
 over at the next check.
 
+A folder inside a Syncthing folder may start when that folder's `.stignore`
+leaves out the whole directory, so one repository at a time can move from
+Syncthing to syncer. The patterns are read as Syncthing reads them: the first
+that matches decides, a pattern without a leading `/` matches at any depth,
+a pattern also covers what is under what it names, `(?i)`, `(?d)` and
+`#include` are understood, and names compare without case on macOS and
+Windows. The directory counts as left out only when a pattern leaves it out
+and no `!` pattern before that one could bring back anything under it.
+
 ## Local control
 
-The service listens on a Unix socket (a named pipe on Windows) in its data
-directory. The command line sends one JSON request per connection and prints
-the answer.
+The service listens on a TCP port on localhost and writes the port and a
+random token to `control.json` in its data directory, readable only by its
+user. The command line sends one request per connection, with the token, and
+prints the answer.
+
+One service runs per data directory: it holds a lock on `lock` there, which
+the system lets go when the process ends however it ends. A second `syncer
+run` with the same data directory refuses to start. Two would share one
+device key and overwrite each other's state.
 
 ## Known limitations
 

@@ -1,7 +1,7 @@
 //! Fetching file content and Git objects from peers.
 
 use crate::{
-    folder::{Folder, index::Hash},
+    folder::{Folder, disk, index::Hash},
     git::{Oid, Repo},
     ids::DeviceId,
     net::{
@@ -12,9 +12,13 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use iroh::endpoint::Connection;
-use std::{io::Read, path::Path, sync::Arc};
+use std::{
+    io::{Read, SeekFrom},
+    path::Path,
+    sync::Arc,
+};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     task::spawn_blocking,
 };
 
@@ -107,10 +111,13 @@ async fn content_from(
     };
     let mut out = tokio::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(false)
         .open(&part)
         .await
         .with_context(|| format!("writing {}", part.display()))?;
+    // Not opened to append: a run of zeros is skipped over, leaving a hole.
+    out.seek(SeekFrom::Start(offset)).await?;
     let mut received = 0u64;
 
     loop {
@@ -119,7 +126,11 @@ async fn content_from(
                 received += bytes.len() as u64;
                 ensure!(received <= size, "the peer sent more than it said");
                 hasher.update(&bytes);
-                out.write_all(&bytes).await?;
+                if disk::is_hole(&bytes) {
+                    out.seek(SeekFrom::Current(bytes.len() as i64)).await?;
+                } else {
+                    out.write_all(&bytes).await?;
+                }
             }
             Chunk::End => break,
             Chunk::Failed(why) => {
@@ -131,6 +142,7 @@ async fn content_from(
         }
     }
 
+    out.set_len(offset + received).await?;
     out.sync_all().await?;
     drop(out);
 
