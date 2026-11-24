@@ -24,9 +24,25 @@ impl Folder {
         let previous_head = lock(&self.rules).tracked().head().cloned();
         let rules = self.reload_rules().await?;
 
+        // Where names fold, a path the watcher reports may be recorded under
+        // another spelling (`README` renamed to `readme`): look at both.
+        let (scope, folding) = {
+            let state = lock(&self.state);
+            let scope = match scope {
+                Scope::Paths(paths) => {
+                    let aliases: Vec<String> = paths
+                        .iter()
+                        .flat_map(|path| state.disk.aliases(path))
+                        .collect();
+                    Scope::Paths(paths.into_iter().chain(aliases).collect())
+                }
+                Scope::All => Scope::All,
+            };
+            (scope, state.disk.folding())
+        };
         let walked = {
             let (root, rules, scope) = (self.root.clone(), rules.clone(), scope.clone());
-            spawn_blocking(move || scan::walk(&root, &rules, &scope)).await?
+            spawn_blocking(move || scan::walk(&root, &rules, &scope, folding)).await?
         };
         {
             let names = &mut lock(&self.problems).names;

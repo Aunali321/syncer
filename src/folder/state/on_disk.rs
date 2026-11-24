@@ -25,7 +25,7 @@ pub struct Disk {
     folding: Folding,
     files: BTreeMap<String, LocalFile>,
     by_hash: HashMap<Hash, BTreeSet<String>>,
-    by_folded: HashMap<String, BTreeSet<String>>,
+    by_folded: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Disk {
@@ -85,7 +85,13 @@ impl Disk {
     pub fn remove(&mut self, path: &str) -> Option<LocalFile> {
         let file = self.files.remove(path)?;
         drop_from(&mut self.by_hash, &file.meta.hash, path);
-        drop_from(&mut self.by_folded, &self.folding.key(path), path);
+        let key = self.folding.key(path);
+        if let Some(paths) = self.by_folded.get_mut(&key) {
+            paths.remove(path);
+            if paths.is_empty() {
+                self.by_folded.remove(&key);
+            }
+        }
         Some(file)
     }
 
@@ -99,6 +105,30 @@ impl Disk {
         self.files
             .get_key_value(path)
             .map(|(path, file)| (path.as_str(), file))
+    }
+
+    /// The recorded paths, other than `path`, that this file system would
+    /// find at `path` or under the directory `path`: other spellings of it.
+    /// None where the file system takes every name as written.
+    pub fn aliases(&self, path: &str) -> Vec<String> {
+        if self.folding == Folding::default() {
+            return Vec::new();
+        }
+        let key = self.folding.key(path);
+        let under = format!("{key}/");
+        self.by_folded
+            .get(&key)
+            .into_iter()
+            .chain(
+                self.by_folded
+                    .range(under.clone()..)
+                    .take_while(|(folded, _)| folded.starts_with(&under))
+                    .map(|(_, paths)| paths),
+            )
+            .flatten()
+            .filter(|other| *other != path)
+            .cloned()
+            .collect()
     }
 
     /// Another path on disk that the file system would take for `path`.
@@ -167,6 +197,15 @@ mod tests {
         assert_eq!(disk.clash("Readme.md"), None);
         assert_eq!(disk.clash("README.md."), Some("Readme.md"));
         assert_eq!(disk.clash("CAFE\u{301}"), Some("caf\u{e9}"));
+        disk.insert("Src/main.rs".into(), file(3));
+        disk.insert("src-old/x".into(), file(4));
+        assert_eq!(disk.aliases("readme.md"), ["Readme.md"]);
+        assert_eq!(
+            disk.aliases("src"),
+            ["Src/main.rs"],
+            "inside a renamed directory"
+        );
+        assert!(disk.aliases("Readme.md").is_empty());
         disk.remove("b");
         assert_eq!(
             disk.holding(&Hash([1; 32]), "b").map(|(path, _)| path),

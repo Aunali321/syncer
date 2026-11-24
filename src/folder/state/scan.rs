@@ -186,7 +186,7 @@ pub mod tests {
     /// Scans `root` fully, reading files as the folder would.
     pub fn scan_all(state: &mut State, root: &std::path::Path) {
         let rules = Rules::new(root, true, Default::default());
-        let walked = scan::walk(root, &rules, &Scope::All);
+        let walked = scan::walk(root, &rules, &Scope::All, Default::default());
         let plan = state.plan_scan(&walked, &Scope::All, &rules);
         let read = plan
             .read

@@ -3,11 +3,16 @@
 //! here blocks.
 
 use crate::folder::{
-    disk::{self, Stat},
+    disk::{self, Folding, Stat},
     index::path_problem,
     rules::Rules,
 };
-use std::{collections::BTreeMap, fs, io::ErrorKind, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs, io,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
 
 /// What a walk found.
 #[derive(Debug, Default)]
@@ -48,7 +53,9 @@ pub fn within(path: &str, dir: &str) -> bool {
         || (path.starts_with(dir) && path.as_bytes().get(dir.len()) == Some(&b'/'))
 }
 
-pub fn walk(root: &Path, rules: &Rules, scope: &Scope) -> Walked {
+/// Walks `scope` of the folder at `root`. On a file system that folds names
+/// (`folding`), a path is only found where it is spelled exactly so.
+pub fn walk(root: &Path, rules: &Rules, scope: &Scope, folding: Folding) -> Walked {
     let mut walked = Walked::default();
 
     match scope {
@@ -64,7 +71,12 @@ pub fn walk(root: &Path, rules: &Rules, scope: &Scope) -> Walked {
                 }
 
                 let full = disk::join(root, path);
-                match fs::symlink_metadata(&full) {
+                let found = match spelled(root, path, folding) {
+                    Ok(true) => fs::symlink_metadata(&full),
+                    Ok(false) => Err(ErrorKind::NotFound.into()),
+                    Err(e) => Err(e),
+                };
+                match found {
                     Ok(meta) if meta.is_dir() => {
                         if !rules.excluded(path, true) {
                             walk_dir(root, path, rules, &mut walked);
@@ -85,6 +97,26 @@ pub fn walk(root: &Path, rules: &Rules, scope: &Scope) -> Walked {
     }
 
     walked
+}
+
+/// Whether every part of `path` exists spelled exactly so. Where names fold,
+/// looking a path up also finds other spellings of it: only a directory's
+/// listing tells which spelling is there.
+fn spelled(root: &Path, path: &str, folding: Folding) -> io::Result<bool> {
+    if folding == Folding::default() {
+        return Ok(true);
+    }
+    let mut dir = PathBuf::from(root);
+    for part in path.split('/') {
+        let listed = fs::read_dir(&dir)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<io::Result<Vec<_>>>()?;
+        if !listed.iter().any(|name| name == part) {
+            return Ok(false);
+        }
+        dir.push(part);
+    }
+    Ok(true)
 }
 
 fn walk_dir(root: &Path, dir: &str, rules: &Rules, walked: &mut Walked) {
@@ -169,7 +201,7 @@ mod tests {
         fs::write(root.join(".syncer/folder"), "id").expect("write");
 
         let rules = Rules::new(root, true, Default::default());
-        let walked = walk(root, &rules, &Scope::All);
+        let walked = walk(root, &rules, &Scope::All, Folding::default());
         let paths: Vec<_> = walked.files.keys().map(String::as_str).collect();
 
         assert_eq!(paths, [".gitignore", "src/deep/a.rs"]);
@@ -185,7 +217,7 @@ mod tests {
 
         let rules = Rules::new(root, true, Default::default());
         let scope = Scope::Paths(vec!["a".into(), "gone".into()]);
-        let walked = walk(root, &rules, &scope);
+        let walked = walk(root, &rules, &scope, Folding::default());
 
         assert_eq!(walked.files.keys().collect::<Vec<_>>(), ["a/b/c"]);
         assert!(scope.covers("a/b/c"));
